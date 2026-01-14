@@ -3206,4 +3206,3 @@ TRACE / HTTP 1.6 sw4_TRACE_25
 TRACE / HTTP 1.7 sw4_TRACE_26
 TRACE / HTTP 1.8 sw4_TRACE_27
 TRACE / HTTP 1.9 sw4_TRACE_28
-Removed: 60, Replaced: 3065, Inserted: 85, Starting requests: 5, Total: 3215

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"flag"
 	"fmt"
+	"io"
+	"os"
 )
 
 type requestLine struct {
@@ -12,6 +16,7 @@ type requestLine struct {
 }
 
 var reqMap = make(map[string]int)
+var outputWriter io.Writer = os.Stdout
 
 func inMap(reqLine string) bool {
 	if _, ok := reqMap[reqLine]; !ok {
@@ -30,6 +35,33 @@ var digits string = "0123456789"
 var charset string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-_=+"
 
 func main() {
+	outPath := flag.String("out", "", "Output file path (default stdout; use '-' for stdout)")
+	flag.Parse()
+
+	var (
+		destFile *os.File
+		writer   *bufio.Writer
+	)
+
+	if *outPath != "" && *outPath != "-" {
+		f, err := os.Create(*outPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		destFile = f
+		writer = bufio.NewWriter(f)
+	} else {
+		writer = bufio.NewWriter(os.Stdout)
+	}
+
+	if destFile != nil {
+		defer destFile.Close()
+	}
+	defer writer.Flush()
+
+	outputWriter = writer
+
 	baselineGET := createRequest("GET", "/", "HTTP", "1.1")
 	baselineOPTIONS := createRequest("OPTIONS", "/", "HTTP", "1.1")
 	baselineHEAD := createRequest("HEAD", "/", "HTTP", "1.1")
@@ -57,7 +89,13 @@ func main() {
 			replaceCharacter(baselineTRACE, i)
 		}
 	}
-	fmt.Printf("Removed: %d, Replaced: %d, Inserted: %d, Starting requests: %d, Total: %d", removedCount, replacedCount, insertedCount, donorCount, donorCount+replacedCount+removedCount+insertedCount)
+
+	if err := writer.Flush(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "Removed: %d, Replaced: %d, Inserted: %d, Starting requests: %d, Total: %d\n", removedCount, replacedCount, insertedCount, donorCount, donorCount+replacedCount+removedCount+insertedCount)
 }
 
 func insertCharacter(request requestLine, part int) {
@@ -99,7 +137,7 @@ func removeCharacter(request requestLine, part int) {
 	}
 
 	if part == 1 {
-		fmt.Println(request.Method, request.URI, request.Protocol, request.HTTPVersion, "base_"+request.Method)
+		fmt.Fprintln(outputWriter, request.Method, request.URI, request.Protocol, request.HTTPVersion, "base_"+request.Method)
 	}
 
 	for i := 0; i < len(target); i++ {
@@ -162,7 +200,7 @@ func processMutation(req requestLine, part int, newVal string, typePrefix string
 
 	if inMap(finalString) {
 		id := fmt.Sprintf("%s%d_%s_%d", typePrefix, part, req.Method, index)
-		fmt.Println(method, uri, proto, version, id)
+		fmt.Fprintln(outputWriter, method, uri, proto, version, id)
 	}
 }
 
