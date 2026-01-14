@@ -454,14 +454,14 @@ func readHTTPHeader(r *bufio.Reader, maxBytes int) ([]byte, error) {
 func mustMarshalJSON(v any) []byte {
 	b, err := json.Marshal(v)
 	if err == nil {
-		return b
+		return sanitizeJSONLLine(b)
 	}
 	fallback := surveyRecord{
 		Domain: "unknown",
 		Error:  "json marshal failed: " + err.Error(),
 	}
 	out, _ := json.Marshal(fallback)
-	return out
+	return sanitizeJSONLLine(out)
 }
 
 func parseRawHTTPResponse(raw []byte, includesBody bool) *responseJSON {
