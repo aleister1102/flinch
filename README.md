@@ -19,6 +19,7 @@ This project implements the approach described in the associated paper, focusing
 - Go 1.16 or higher
 - Make
 - Python 3.11+ (managed via `uv` recommended)
+- Python packages listed in `requirements.txt`
 
 ## Installation
 
@@ -26,6 +27,13 @@ To build all tools:
 
 ```bash
 make build
+```
+
+To install Python dependencies:
+
+```bash
+# Using uv (recommended)
+uv pip install -r requirements.txt
 ```
 
 The binaries will be created in the `bin/` directory:
@@ -70,18 +78,26 @@ head -n 50 data/majestic_100k.csv > data/targets.csv
 
 Use `survey` to send the generated requests to a list of domains.
 
-**Arguments:**
-- `-file`: Path to the CSV file containing domains.
-- `-col`: 1-based column number in the CSV file where the domain is located.
-- `-out`: Output directory for response files (default: `responses`).
-- `-requests`: Path to the request set file (default: `data/request_set.txt`).
+#### Optional: Filter Unresolvable Domains (Recommended)
+
+To reduce DNS resolution errors (e.g. `no such host`) and speed up surveying, you can filter `data/targets.csv` down to only domains that resolve using `puredns` (must be installed separately). `puredns` requires `massdns` to be installed and runnable on your machine.
+
+```bash
+# Produces: data/targets.csv.resolved.csv
+uv run scripts/puredns_filter_csv.py data/targets.csv -b 500 -s 2
+```
 
 **Example:**
 ```bash
-mkdir -p responses
-./bin/survey -file data/targets.csv -col 1 -out responses
+./bin/survey
 ```
-This will save responses in the `responses/` directory.
+Defaults:
+- Input: `data/targets.csv.resolved.csv` if present, else `data/targets.csv`
+- Column: `-C 1`
+- Requests: `data/request_set.txt`
+- Output: `responses/`
+
+Each output file is JSON lines (one JSON object per request/response).
 
 ### 4. Generate ID Maps
 
@@ -96,7 +112,7 @@ uv run scripts/generate_map.py
 **Step 4b: Parse Headers from Responses**
 Scans your collected responses to build unique ID maps for headers and status codes.
 ```bash
-uv run scripts/parseheaders.py --input responses --out-dir data
+uv run scripts/parse_headers.py --input responses --out-dir data
 ```
 
 ### 5. Filter Responses (Optional)
@@ -141,11 +157,11 @@ make build
 
 # Create responses/ for your training domains and run the survey
 mkdir -p responses
-./bin/survey -file data/targets.csv -col 1 -out responses -requests data/request_set.txt
+./bin/survey -f data/targets.csv.resolved.csv -C 1 -o responses -r data/request_set.txt
 
 # Generate request-type map + header/status ID maps (used by feature extraction)
 uv run scripts/generate_map.py
-uv run scripts/parseheaders.py --input responses --out-dir data
+uv run scripts/parse_headers.py --input responses --out-dir data
 ```
 
 ### 1. Train the Model
@@ -176,7 +192,7 @@ To fingerprint a new domain, reuse the same `data/` ID maps from training (so fe
 ```bash
 # 1. Survey the target (single-domain file, domain in column 1)
 echo "target-domain.com" > data/target.csv
-./bin/survey -file data/target.csv -col 1 -out target_responses -requests data/request_set.txt
+./bin/survey -f data/target.csv -C 1 -o target_responses -r data/request_set.txt
 
 # 2. Extract features (reuse the same data/ maps generated from training)
 ./bin/features -input target_responses -output target_features.csv -data data
@@ -197,13 +213,11 @@ make build
 ./bin/fuzzy > data/request_set.txt
 
 # 3. Create a list of target domains (example)
-# You can use the helper script to sample from Majestic Million (if present in data/)
-# uv run scripts/sample_domains.py
 echo "example.com" > data/targets.csv
 
 # 4. Run the survey (ensure 'responses' dir exists)
 mkdir -p responses
-./bin/survey -file data/targets.csv -col 1 -out responses
+./bin/survey -f data/targets.csv.resolved.csv -C 1 -o responses
 
 # 5. Extract features
 ./bin/features -input responses/ -output results.csv

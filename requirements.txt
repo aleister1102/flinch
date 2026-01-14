@@ -1,0 +1,9 @@
+pandas
+numpy
+joblib
+scikit-learn
+tabulate
+matplotlib
+scipy
+seaborn
+graphviz
