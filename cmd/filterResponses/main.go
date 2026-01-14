@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -35,19 +36,37 @@ func findNonRespondants(path string) {
 				log.Fatal(err)
 			}
 			fileString := string(f)
-			rawResponse := strings.Split(fileString, "\n______________\n")
-			if len(rawResponse) > 1 {
-				rawResponse = rawResponse[:len(rawResponse)-2]
-			} else {
-				rawResponse = strings.Split(fileString, "\n______________\r\n")
+			trimmed := strings.TrimSpace(fileString)
+			if trimmed == "" || trimmed[0] != '{' {
+				fmt.Println(fileName)
+				return nil
 			}
-			counter := 0
-			for _, response := range rawResponse {
-				if strings.HasPrefix(response, "exit") {
-					counter++
+
+			type rec struct {
+				Error    string `json:"error"`
+				Response *struct {
+					StatusCode int `json:"status_code"`
+				} `json:"response"`
+			}
+
+			total := 0
+			success := 0
+			for _, line := range strings.Split(fileString, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				total++
+				var r rec
+				if err := json.Unmarshal([]byte(line), &r); err != nil {
+					continue
+				}
+				if r.Error == "" && r.Response != nil && r.Response.StatusCode > 0 {
+					success++
 				}
 			}
-			if len(rawResponse) == counter {
+
+			if total == 0 || success == 0 {
 				fmt.Println(fileName)
 			}
 		}

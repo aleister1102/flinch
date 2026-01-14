@@ -214,6 +214,14 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 		nmapResults[line[0]] = line[1]
 	}
 
+	resFile, err := os.OpenFile(pathToCSV, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resFile.Close()
+	csvWriter := csv.NewWriter(resFile)
+	defer csvWriter.Flush()
+
 	filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
 		fileInfo, err2 := os.Stat(path)
 		if err2 != nil {
@@ -250,237 +258,181 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 				log.Fatal(err)
 			}
 			fileString := string(f)
-			rawResponse := strings.Split(fileString, "\n______________\n")
-			if len(rawResponse) > 1 {
-				rawResponse = rawResponse[:len(rawResponse)-2]
-			} else {
-				rawResponse = strings.Split(fileString, "\n______________\r\n")
+
+			records := parseSurveyJSONL(fileString)
+			if len(records) == 0 {
+				skipped++
+				return nil
 			}
-			for _, response := range rawResponse {
+
+			for _, rec := range records {
 				var csvFields []string
-				if response != "" && response != "unidentified error" {
-					statusCode, statusMessage, headers, serverValue, hasBody, headerValues, reqLine, redirected = stringManipulation(response)
-					if redirected {
-						redirectedCount++
-						return nil //uncomment if wild set, comment for vm
-					}
-					if !IsNumbers(statusCode) {
-						skipped++
-						continue //comment for vm
-					}
-					serverValue2 = append(serverValue2, serverValue...)
+				statusCode, statusMessage, headers, serverValue, hasBody, headerValues, reqLine, redirected = stringManipulationJSON(rec)
+				if redirected {
+					redirectedCount++
+					return nil
+				}
+				if !IsNumbers(statusCode) {
+					skipped++
+					continue
+				}
+				serverValue2 = append(serverValue2, serverValue...)
 
-					for i := 0; i < len(headers); i++ {
-						if contains(filteredHeaders, headers[i]) {
-							if i == 0 {
-								filteredFound = filteredFound + headers[i]
+				for i := 0; i < len(headers); i++ {
+					if contains(filteredHeaders, headers[i]) {
+						if i == 0 {
+							filteredFound = filteredFound + headers[i]
 
-							} else {
-								filteredFound = filteredFound + " " + headers[i]
-							}
 						} else {
-							continue
+							filteredFound = filteredFound + " " + headers[i]
 						}
+					} else {
+						continue
 					}
-					if filteredFound == "" {
-						filteredFound = "no_headers"
+				}
+				if filteredFound == "" {
+					filteredFound = "no_headers"
+				}
+				if filteredFound[:1] == " " {
+					filteredFound = trimLeftChars(filteredFound, 1)
+				}
+				var server string
+				for i := 0; i < len(serverValue2); i++ {
+					if serverValue2[i] != "no_server_header_found" {
+						server = serverValue2[i]
+					} else {
+						continue
 					}
-					if filteredFound[:1] == " " {
-						filteredFound = trimLeftChars(filteredFound, 1)
-					}
-					var server string
-					for i := 0; i < len(serverValue2); i++ {
-						if serverValue2[i] != "no_server_header_found" {
-							server = serverValue2[i]
-						} else {
-							continue
-						}
-					}
-					if server == "" {
-						server = "unknown"
-					}
-					var reqType string
-					var reqTypeID string
-					reqLineSlice := strings.Split(reqLine, " ")
-					reqType = reqLineSlice[len(reqLineSlice)-1]
-					if _, ok := typeMap[reqType]; ok {
-						reqTypeID = typeMap[reqType]
-					}
-					// for i := 0; i < len(fuzzTypes); i++ {
-					// 	if contains(strings.Split(reqLine, " "), fuzzTypes[i]) {
-					// 		reqType = fuzzTypes[i]
-					// 		switch {
-					// 		case reqType == "base_GET":
-					// 			reqTypeID = "10000"
-					// 		case reqType == "base_HEAD":
-					// 			reqTypeID = "10001"
-					// 		case reqType == "base_OPTIONS":
-					// 			reqTypeID = "10002"
-					// 		case reqType == "base_DELETE":
-					// 			reqTypeID = "10003"
-					// 		case reqType == "base_TRACE":
-					// 			reqTypeID = "10004"
-					// 		case reqType == "ins1_GET":
-					// 			reqTypeID = "10005"
-					// 		case reqType == "ins1_TRACE":
-					// 			reqTypeID = "10006"
-					// 		case reqType == "ins1_OPTIONS":
-					// 			reqTypeID = "10007"
-					// 		case reqType == "ins1_HEAD":
-					// 			reqTypeID = "10008"
-					// 		case reqType == "ins1_DELETE":
-					// 			reqTypeID = "10009"
-					// 		}
-					// 		break
-					// 	}
-					// }
-					csvFields = append(csvFields, fileName)
-					csvFields = append(csvFields, reqLine)
-					parentType := strings.Split(reqType, "_")
-					//par1
+				}
+				if server == "" {
+					server = "unknown"
+				}
+				var reqType string
+				var reqTypeID string
+				reqLineSlice := strings.Split(reqLine, " ")
+				reqType = reqLineSlice[len(reqLineSlice)-1]
+				if _, ok := typeMap[reqType]; ok {
+					reqTypeID = typeMap[reqType]
+				}
+				csvFields = append(csvFields, fileName)
+				csvFields = append(csvFields, reqLine)
+				parentType := strings.Split(reqType, "_")
+				csvFields = append(csvFields, parentType[0])
+				if len(parentType) <= 1 {
 					csvFields = append(csvFields, parentType[0])
-					//par2
-					if len(parentType) <= 1 {
-						csvFields = append(csvFields, parentType[0])
+				} else {
+					csvFields = append(csvFields, parentType[0]+"_"+parentType[1])
+				}
+
+				csvFields = append(csvFields, reqTypeID)
+
+				if _, ok := filteredHeadersID[filteredFound]; !ok {
+					filteredHeadersID[filteredFound] = filteredHeadersIDCounter
+					filteredHeadersIDCounter++
+				}
+
+				if _, ok := msgID[statusMessage]; !ok {
+					if statusMessage != "no_status_message" {
+						msgID[statusMessage] = max(msgID) + 1
 					} else {
-						csvFields = append(csvFields, parentType[0]+"_"+parentType[1])
+						msgID[statusMessage] = 10000
 					}
+				}
 
-					csvFields = append(csvFields, reqTypeID)
-					// if codeID[statusCode] == 0 {
-					// 	codeID[statusCode] = 10000
-					// }
-
-					// if msgID[statusMessage] == 0 {
-					// 	msgID[statusMessage] = 10000
-					// }
-
-					if _, ok := filteredHeadersID[filteredFound]; !ok {
-						filteredHeadersID[filteredFound] = filteredHeadersIDCounter
-						filteredHeadersIDCounter++
-					}
-
-					if _, ok := msgID[statusMessage]; !ok {
-						if statusMessage != "no_status_message" {
-							msgID[statusMessage] = max(msgID) + 1
-						} else {
-							msgID[statusMessage] = 10000
-						}
-
-						// fmt.Println(max(msgID))
-
-					}
-					// fmt.Println(statusCode)
-
-					if _, ok := codeID[statusCode]; !ok {
-						if statusMessage != "no_status_message" {
-							codeID[statusCode] = max(codeID) + 1
-						} else {
-							codeID[statusCode] = 10000
-						}
-						// fmt.Println(max(codeID))
-						// fmt.Println(statusCode)
-
-					}
-					//handle st msg and st code IDs not present in VMs
-
-					csvFields = append(csvFields, strconv.Itoa(filteredHeadersID[filteredFound]))
-					csvFields = append(csvFields, strconv.Itoa(codeID[statusCode]))
-					csvFields = append(csvFields, strconv.Itoa(msgID[statusMessage]))
-					if hasBody {
-						csvFields = append(csvFields, "1")
+				if _, ok := codeID[statusCode]; !ok {
+					if statusMessage != "no_status_message" {
+						codeID[statusCode] = max(codeID) + 1
 					} else {
-						csvFields = append(csvFields, "0")
+						codeID[statusCode] = 10000
 					}
-					if statusCode != "no_status_code" && statusCode != "" {
-						hasStatusCode = true
-					} else {
-						hasStatusCode = false
-					}
-					if statusMessage != "no_status_message" && statusMessage != "" {
-						hasStatusMessage = true
-					} else {
-						hasStatusMessage = false
-					}
-					if hasStatusCode {
-						csvFields = append(csvFields, "1")
-					} else {
-						csvFields = append(csvFields, "0")
-					}
-					if hasStatusMessage {
-						csvFields = append(csvFields, "1")
-					} else {
-						csvFields = append(csvFields, "0")
-					}
-					for _, header := range indHeaders {
-						if contains(headers, header) {
-							for i := range headers {
-								if strings.EqualFold(headers[i], header) {
-									headerValueID := valueID[headerValues[i]]
-									//handle headerValues not present in the set
-									if _, ok := valueID[headerValues[i]]; !ok {
-										valueID[headerValues[i]] = max(valueID) + 1
-									}
-									fieldID := strconv.Itoa(headerID[header])
-									if fieldID == "" || fieldID == " " {
-										fieldID = "10000"
-									}
-									//???
-									csvFields = append(csvFields, "1")
-									if IsUpper(headers[i]) {
-										// csvFields = append(csvFields, "upper") //upper
-										csvFields = append(csvFields, "10001")
-									} else if IsLower(headers[i]) {
-										// csvFields = append(csvFields, "lower") //lower
-										csvFields = append(csvFields, "10002")
-									} else {
-										// csvFields = append(csvFields, "mixed") //mixed
-										csvFields = append(csvFields, "10003")
-									}
-									csvFields = append(csvFields, fieldID)
-									if headerValueID == 0 {
-										headerValueID = 10000
-									}
-									csvFields = append(csvFields, strconv.Itoa(headerValueID))
+				}
+
+				csvFields = append(csvFields, strconv.Itoa(filteredHeadersID[filteredFound]))
+				csvFields = append(csvFields, strconv.Itoa(codeID[statusCode]))
+				csvFields = append(csvFields, strconv.Itoa(msgID[statusMessage]))
+				if hasBody {
+					csvFields = append(csvFields, "1")
+				} else {
+					csvFields = append(csvFields, "0")
+				}
+				if statusCode != "no_status_code" && statusCode != "" {
+					hasStatusCode = true
+				} else {
+					hasStatusCode = false
+				}
+				if statusMessage != "no_status_message" && statusMessage != "" {
+					hasStatusMessage = true
+				} else {
+					hasStatusMessage = false
+				}
+				if hasStatusCode {
+					csvFields = append(csvFields, "1")
+				} else {
+					csvFields = append(csvFields, "0")
+				}
+				if hasStatusMessage {
+					csvFields = append(csvFields, "1")
+				} else {
+					csvFields = append(csvFields, "0")
+				}
+				for _, header := range indHeaders {
+					if contains(headers, header) {
+						for i := range headers {
+							if strings.EqualFold(headers[i], header) {
+								headerValueID := valueID[headerValues[i]]
+								if _, ok := valueID[headerValues[i]]; !ok {
+									valueID[headerValues[i]] = max(valueID) + 1
 								}
+								fieldID := strconv.Itoa(headerID[header])
+								if fieldID == "" || fieldID == " " {
+									fieldID = "10000"
+								}
+								csvFields = append(csvFields, "1")
+								if IsUpper(headers[i]) {
+									csvFields = append(csvFields, "10001")
+								} else if IsLower(headers[i]) {
+									csvFields = append(csvFields, "10002")
+								} else {
+									csvFields = append(csvFields, "10003")
+								}
+								csvFields = append(csvFields, fieldID)
+								if headerValueID == 0 {
+									headerValueID = 10000
+								}
+								csvFields = append(csvFields, strconv.Itoa(headerValueID))
 							}
-						} else {
-							csvFields = append(csvFields, "0")
-							csvFields = append(csvFields, "10000")
-							csvFields = append(csvFields, "10000")
-							csvFields = append(csvFields, "10000")
 						}
-					}
-					if strings.Contains(server, "/") {
-						noVersion := strings.SplitN(server, "/", 2)
-						csvFields = append(csvFields, strings.Trim(strings.ToLower(noVersion[0]), " "))
 					} else {
-						csvFields = append(csvFields, strings.Trim(strings.ToLower(server), " "))
+						csvFields = append(csvFields, "0")
+						csvFields = append(csvFields, "10000")
+						csvFields = append(csvFields, "10000")
+						csvFields = append(csvFields, "10000")
 					}
-					csvFields = append(csvFields, nmapValue)
 				}
+				if strings.Contains(server, "/") {
+					noVersion := strings.SplitN(server, "/", 2)
+					csvFields = append(csvFields, strings.Trim(strings.ToLower(noVersion[0]), " "))
+				} else {
+					csvFields = append(csvFields, strings.Trim(strings.ToLower(server), " "))
+				}
+				csvFields = append(csvFields, nmapValue)
+
 				filteredFound = ""
-				resFile, err := os.OpenFile(pathToCSV, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-				if err != nil {
-					log.Fatalln("failed to open file", err)
-				}
-				defer resFile.Close()
-				w := csv.NewWriter(resFile)
 				if len(csvFields) != lenOfHeaders {
 					skipped++
-					continue // comment for vm
+					continue
 				}
 				if contains(csvFields, "<") || contains(csvFields, ">") {
 					skipped++
-					continue //comment for vm
+					continue
 				}
 				if strings.Join(csvFields, "") != "" {
-					w.Write(csvFields)
-					w.Flush()
-
+					if err := csvWriter.Write(csvFields); err != nil {
+						log.Fatal(err)
+					}
 				} else {
 					skipped++
-					continue // comment for vm
+					continue
 				}
 			}
 
@@ -500,161 +452,74 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 
 }
 
-func stringManipulation(fileContents string) (string, string, []string, []string, bool, []string, string, bool) {
-	var headers []string
-	var headersWithValue []string
-	var serverHeader []string
-	var fullResp []string
-	var redirected bool
-	var hasBody bool
-	var headerValues []string
-	var reqLine string
+type surveyJSONRecord struct {
+	Domain  string `json:"domain"`
+	Error   string `json:"error"`
+	Request struct {
+		Raw string `json:"raw"`
+	} `json:"request"`
+	Response *struct {
+		StatusCode int    `json:"status_code"`
+		Status     string `json:"status"`
+		Headers    []struct {
+			K string `json:"k"`
+			V string `json:"v"`
+		} `json:"headers"`
+		BodyB64 string `json:"body_b64"`
+	} `json:"response"`
+}
 
-	temp := strings.Split(fileContents, "\r\n\r")
-	// fmt.Println(temp[len(temp)-2]) // THIS IS THE LAST RESPONSE PART BEFORE THE BODY FOR REDIRECTS
-	// fmt.Println(temp[len(temp)-1]) // THIS IS THE BODY
-	// temp[0] is a response with no body
-
-	//everything else in temp should either be empty, or body
-	// fmt.Println(temp[0])
-	if len(temp) > 2 {
-
-		fullResp = strings.Split(temp[len(temp)-2], "\r\n")
-		fullResp[0] = trimLeftChars(fullResp[0], 1)
-		if !contains(fullResp, "curl") || !contains(fullResp, "echo") {
-			reqLine = strings.Split(temp[0], "\ncool_delimiter_333\n")[0]
-			// fmt.Println(reqLine)
+func parseSurveyJSONL(contents string) []surveyJSONRecord {
+	var out []surveyJSONRecord
+	for _, line := range strings.Split(contents, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-		redirected = true
-		hasBody = true
-	} else {
-		fullResp = strings.Split(temp[0], "\ncool_delimiter_333\n")
-		redirected = false
-		hasBody = false
-		if len(temp) == 2 {
-			hasBody = true
-			// fmt.Println(hasBody, temp[len(temp)-1])
+		var rec surveyJSONRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
 		}
-		reqLine = strings.Split(temp[0], "\ncool_delimiter_333\n")[0]
+		out = append(out, rec)
 	}
-	// fmt.Println(fullResp)
-	if len(fullResp) >= 2 {
+	return out
+}
 
-		if !redirected {
-			if len(fullResp[1]) != 0 && len(fullResp[1]) >= 4 && fullResp[1][:4] == "HTTP" {
-				spaceSplit := strings.Split(fullResp[1], " ")
-				// print(spaceSplit)
-				statusCode := spaceSplit[1]
-				lineSplit := strings.Split(fullResp[1], "\r\n") //can also use this for headers
-				// statusMessage := strings.Split(lineSplit[0], " ")
-				firstLineLength := len(strings.Split(lineSplit[0], " "))
-				i := 2
-				var finalStatusMessage string
-				for i < firstLineLength {
-					if i == 2 {
-						finalStatusMessage = finalStatusMessage + (strings.Split(lineSplit[0], " "))[i]
-						i++
-					} else {
-						finalStatusMessage = finalStatusMessage + " " + (strings.Split(lineSplit[0], " "))[i]
-						i++
-					}
-				}
+func stringManipulationJSON(rec surveyJSONRecord) (string, string, []string, []string, bool, []string, string, bool) {
+	var headers []string
+	var serverHeader []string
+	var headerValues []string
+	hasBody := false
+	redirected := false
 
-				finalStatusMessage = strings.Trim(finalStatusMessage, "\r")
-				//just for testing purposes don't use this
-				// msgesList := []string{"METHOD_NOT_ALLOWED", "Page Not Found", "Http to Https", "unknown status", "Method not implemented", "Origin Error", "Origin Connection Time-out", "OK", "Created", "Accepted", "Non-Authoritative Information", "No Content", "Reset Content",
-				// 	"Partial Content", "Multi-Status", "Already Reported", "IM Used", "Multiple Choices", "Moved Permanently",
-				// 	"Found", "See Other", "Not Modified", "Use Proxy", "Switch Proxy", "Temporary Redirect", "Permanent Redirect",
-				// 	"Bad Request", "Unauthorized", "Payment Required", "Forbidden", "Not Found", "Method Not Allowed", "Not Acceptable",
-				// 	"Proxy Authentication Required", "Request Timeout", "Conflict", "Gone", "Length Required", "Precondition Failed",
-				// 	"Payload Too Large", "URI Too Long", "Unsupported Media Type", "Range Not Satisfiable", "Expectation Failed",
-				// 	"I'm a teapot", "Misdirected Request", "Unprocessable Entity", "Locked", "Failed Dependency", "Too Early", "Upgrade Required",
-				// 	"Precondition Required", "Too Many Requests", "Request Header Fields Too Large", "Unavailable For Legal Reasons", "Internal Server Error",
-				// 	"Not Implemented", "Bad Gateway", "Service Unavailable", "Gateway Timeout", "HTTP Version Not Supported", "Variant Also Negotiates",
-				// 	"Insufficient Storage", "Loop Detected", "Not Extended", "Network Authentication Required", "", "Not Allowed", "Service Temporarily Unavailable"}
-				if len(strings.Split(finalStatusMessage, "\n")) > 1 {
-					finalStatusMessage = strings.Split(finalStatusMessage, "\n")[0]
-				}
+	reqLine := rec.Request.Raw
+	if rec.Response == nil || rec.Error != "" {
+		return "no_status_code", "no_status_message", []string{"no_headers"}, []string{"no_server_header_found"}, false, []string{"no_headers"}, reqLine, redirected
+	}
 
-				if finalStatusMessage == "" {
-					finalStatusMessage = "no_status_message"
-				}
-				for n := 1; n < len(lineSplit); n++ {
-					header := strings.SplitN(lineSplit[n], ":", 2)
-					if len(header) < 2 {
-						header = append(header, "no_header")
-					}
-					headersWithValue = append(headersWithValue, header[0]+":"+header[1])
-					headers = append(headers, header[0])
-					headerValues = append(headerValues, header[1])
-					if strings.EqualFold(header[0], "Server") {
-						serverHeader = append(serverHeader, trimLeftChars(header[1], 1))
-					}
-				}
-				return statusCode, finalStatusMessage, headers, serverHeader, hasBody, headerValues, reqLine, redirected
-				// return statusCode, finalStatusMessage, headers, serverHeader, hasBody, headersWithValue
-			}
-		} else {
-			if len(fullResp[0]) >= 4 {
-				if fullResp[0][:4] == "HTTP" {
-					spaceSplit := strings.Split(fullResp[0], " ")
-					// print(spaceSplit)
-					statusCode := spaceSplit[1]
-					lineSplit := strings.Split(fullResp[0], "\r\n") //can also use this for headers
-					// statusMessage := strings.Split(lineSplit[0], " ")
-					firstLineLength := len(strings.Split(lineSplit[0], " "))
-					i := 2
-					var finalStatusMessage string
-					for i < firstLineLength {
-						if i == 2 {
-							finalStatusMessage = finalStatusMessage + (strings.Split(lineSplit[0], " "))[i]
-							i++
-						} else {
-							finalStatusMessage = finalStatusMessage + " " + (strings.Split(lineSplit[0], " "))[i]
-							i++
-						}
-					}
-					finalStatusMessage = strings.Trim(finalStatusMessage, "\r")
-					if finalStatusMessage == "" {
-						finalStatusMessage = "no_status_message"
-					}
-					for n := 1; n < len(lineSplit); n++ {
-						header := strings.SplitN(lineSplit[n], ":", 2)
-						headersWithValue = append(headersWithValue, header[0]+":"+header[1])
-						headers = append(headers, header[0])
-						if header[1] != "\n" {
-							headerValues = append(headerValues, header[1])
-						} else {
-							headerValues = append(headerValues, "no_headers")
-						}
+	statusCode := strconv.Itoa(rec.Response.StatusCode)
+	statusMessage := rec.Response.Status
+	if statusMessage == "" {
+		statusMessage = "no_status_message"
+	}
+	if rec.Response.BodyB64 != "" {
+		hasBody = true
+	}
 
-						if strings.EqualFold(header[0], "Server") {
-							serverHeader = append(serverHeader, trimLeftChars(header[1], 1))
-						}
-					}
-					return statusCode, finalStatusMessage, headers, serverHeader, hasBody, headerValues, reqLine, redirected
-					// return statusCode, finalStatusMessage, headers, serverHeader, hasBody, headersWithValue
-
-				}
-			}
+	for _, h := range rec.Response.Headers {
+		headers = append(headers, h.K)
+		headerValues = append(headerValues, h.V)
+		if strings.EqualFold(h.K, "Server") {
+			serverHeader = append(serverHeader, h.V)
 		}
-
-	} else {
+	}
+	if len(headers) == 0 {
 		headers = append(headers, "no_headers")
 		headerValues = append(headerValues, "no_headers")
-		// headersWithValue = append(headersWithValue, "no_headers")
+	}
+	if len(serverHeader) == 0 {
 		serverHeader = append(serverHeader, "no_server_header_found")
-		return "no_status_code", "no_status_message", headers, serverHeader, hasBody, headerValues, reqLine, redirected
-		// return "no_status_code", "no_status_message", headers, serverHeader, hasBody, headersWithValue
 	}
 
-	// time.Sleep(10 * time.Second)
-	headers = append(headers, "no_headers")
-	headerValues = append(headerValues, "no_headers")
-
-	// headersWithValue = append(headersWithValue, "no_headers")
-	serverHeader = append(serverHeader, "no_server_header_found")
-
-	return "no_status_code", "no_status_message", headers, serverHeader, hasBody, headerValues, reqLine, redirected
-	// return "no_status_code", "no_status_message", headers, serverHeader, hasBody, headersWithValue
+	return statusCode, statusMessage, headers, serverHeader, hasBody, headerValues, reqLine, redirected
 }

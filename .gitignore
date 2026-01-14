@@ -1,7 +1,6 @@
 .DS_Store
 
-.trae/
-
+.trae/skills
 .venv/
 .uv_cache/
 
