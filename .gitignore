@@ -1,0 +1,17 @@
+.DS_Store
+
+.trae/
+
+.venv/
+.uv_cache/
+
+bin/
+responses/
+target_responses/
+model_artifacts/
+
+dataset.csv
+predictions.csv
+target_features.csv
+
+data/majestic_100k.csv
