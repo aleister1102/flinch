@@ -15,7 +15,7 @@ import joblib
 import sys
 import os
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import FunctionTransformer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 
@@ -73,23 +73,29 @@ def main():
     print(f"Features shape: {features.shape}")
     print(f"Labels shape: {labels.shape}")
 
-    # Remove low variance features (variance = 0)
-    print("Removing low variance features...")
-    variance = features.var()
-    low_variance_cols = [col for col in features.columns if variance[col] == 0]
-    print(f"Dropping {len(low_variance_cols)} low variance columns.")
-    features.drop(low_variance_cols, axis=1, inplace=True)
+    features_np = features.to_numpy(dtype=np.float32, copy=False)
+    np.nan_to_num(features_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    print("Removing constant features...")
+    col_min = np.min(features_np, axis=0)
+    col_max = np.max(features_np, axis=0)
+    keep_mask = (col_max - col_min) != 0
+    dropped = int((~keep_mask).sum())
+    print(f"Dropping {dropped} constant columns.")
+
+    if dropped > 0:
+        features_np = features_np[:, keep_mask]
+        kept_columns = features.columns.to_numpy()[keep_mask]
+        feature_names = kept_columns.tolist()
+    else:
+        feature_names = features.columns.tolist()
 
     # Save the list of kept feature names to ensure alignment during prediction
-    feature_names = features.columns.tolist()
     joblib.dump(feature_names, os.path.join(args.out_dir, "feature_names.pkl"))
 
-    # Scale features
-    print("Scaling features...")
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(features.values)
-    # scaled_features is a numpy array, but we can keep it that way for training
-    
+    print("Preparing scaler...")
+    scaler = FunctionTransformer(validate=False)
+    scaled_features = scaler.fit_transform(features_np)
     joblib.dump(scaler, os.path.join(args.out_dir, "scaler.pkl"))
 
     # Train/Test split

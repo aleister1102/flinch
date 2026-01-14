@@ -16,11 +16,10 @@ def generate_map(request_file, output_file):
 
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        # Pad with 6 empty columns, then Key (req_type), then Value (ID)
-        # rec[6] is key, rec[7] is value
+        writer.writerow(["req_type", "id"])
         id_counter = 10000
         for req_type in sorted(unique_types):
-            writer.writerow(['', '', '', '', '', '', req_type, str(id_counter)])
+            writer.writerow([req_type, str(id_counter)])
             id_counter += 1
 
 if __name__ == "__main__":

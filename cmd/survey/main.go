@@ -72,8 +72,8 @@ type surveyRecord struct {
 }
 
 func main() {
-	csvParam := flag.String("f", "", "path to CSV file containing domains")
-	columnFlag := flag.String("C", "1", "1-based column number containing domains")
+	csvParam := flag.String("f", "", "path to domains file (CSV or plain text)")
+	columnFlag := flag.String("C", "", "1-based column number containing domains (default: auto-detect)")
 	outputDir := flag.String("o", "responses", "output directory for response files")
 	requestsFlag := flag.String("r", "data/request_set.txt", "path to request set file")
 	concurrency := flag.Int("c", 100, "maximum number of concurrent domains to process")
@@ -84,26 +84,37 @@ func main() {
 	flag.Parse()
 
 	if strings.TrimSpace(*csvParam) == "" {
-		if _, err := os.Stat("data/targets.csv.resolved.csv"); err == nil {
-			*csvParam = "data/targets.csv.resolved.csv"
-		} else {
-			*csvParam = "data/targets.csv"
+		candidates := []string{
+			"data/targets.csv.resolved.txt",
+			"data/targets.csv.resolved.csv",
+			"data/targets.txt",
+			"data/targets.csv",
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				*csvParam = c
+				break
+			}
 		}
 	}
 
-	colIdx, err := strconv.Atoi(*columnFlag)
-	if err != nil || colIdx < 1 {
-		log.Fatalf("invalid column number: %s", *columnFlag)
+	var colOverride *int
+	if strings.TrimSpace(*columnFlag) != "" {
+		colIdx, err := strconv.Atoi(*columnFlag)
+		if err != nil || colIdx < 1 {
+			log.Fatalf("invalid column number: %s", *columnFlag)
+		}
+		colIdx--
+		colOverride = &colIdx
 	}
-	colIdx-- // 1-based to 0-based
 
 	if err := os.MkdirAll(*outputDir, 0o755); err != nil {
 		log.Fatalf("failed to create output dir %s: %v", *outputDir, err)
 	}
 
-	domainList, err := parseCsv(*csvParam, colIdx)
+	domainList, err := parseDomainsFile(*csvParam, colOverride)
 	if err != nil {
-		log.Fatalf("failed to parse CSV: %v", err)
+		log.Fatalf("failed to parse domains file: %v", err)
 	}
 
 	fuzzLines, err := readFuzzFile(*requestsFlag)
@@ -160,15 +171,17 @@ func main() {
 	bar.Finish()
 }
 
-func parseCsv(filename string, colIdx int) ([]string, error) {
+func parseDomainsFile(filename string, colOverride *int) ([]string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var domains []string
+	var rows [][]string
 	reader := csv.NewReader(f)
+	reader.FieldsPerRecord = -1
+	reader.LazyQuotes = true
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -177,9 +190,45 @@ func parseCsv(filename string, colIdx int) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if colIdx < len(record) {
-			domains = append(domains, record[colIdx])
+		if len(record) == 0 {
+			continue
 		}
+		rows = append(rows, record)
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("no rows found")
+	}
+
+	startIdx := 0
+	var colIdx int
+	if colOverride != nil {
+		colIdx = *colOverride
+		if colIdx < 0 {
+			colIdx = 0
+		}
+		if looksLikeHeader(rows[0]) && len(rows) > 1 {
+			startIdx = 1
+		}
+	} else {
+		colIdx, startIdx = chooseDomainColumn(rows)
+	}
+
+	seen := make(map[string]struct{}, len(rows))
+	var domains []string
+	for _, row := range rows[startIdx:] {
+		if colIdx >= len(row) {
+			continue
+		}
+		if d, ok := normalizeDomainCandidate(row[colIdx]); ok {
+			if _, exists := seen[d]; exists {
+				continue
+			}
+			seen[d] = struct{}{}
+			domains = append(domains, d)
+		}
+	}
+	if len(domains) == 0 {
+		return nil, fmt.Errorf("no domains found")
 	}
 	return domains, nil
 }
@@ -259,6 +308,142 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, cli
 		writer.WriteByte('\n')
 	}
 	writer.Flush()
+}
+
+func looksLikeHeader(row []string) bool {
+	if len(row) == 0 {
+		return false
+	}
+	tokens := []string{"domain", "domains", "host", "hostname", "fqdn", "url", "website", "site"}
+	for _, cell := range row {
+		c := strings.ToLower(strings.TrimSpace(cell))
+		for _, t := range tokens {
+			if c == t || strings.Contains(c, "domain") {
+				return true
+			}
+		}
+	}
+	domainCount := 0
+	for _, cell := range row {
+		if _, ok := normalizeDomainCandidate(cell); ok {
+			domainCount++
+		}
+	}
+	return domainCount == 0
+}
+
+func chooseDomainColumn(rows [][]string) (int, int) {
+	maxCols := 0
+	for _, r := range rows {
+		if len(r) > maxCols {
+			maxCols = len(r)
+		}
+	}
+	if maxCols == 0 {
+		return 0, 0
+	}
+
+	startIdx := 0
+	if looksLikeHeader(rows[0]) && len(rows) > 1 {
+		for idx, cell := range rows[0] {
+			c := strings.ToLower(strings.TrimSpace(cell))
+			if c == "domain" || c == "domains" || c == "host" || c == "hostname" || c == "fqdn" || c == "url" || strings.Contains(c, "domain") {
+				return idx, 1
+			}
+		}
+		startIdx = 1
+	}
+
+	bestCol := 0
+	bestScore := -1
+	sampleEnd := startIdx + 250
+	if sampleEnd > len(rows) {
+		sampleEnd = len(rows)
+	}
+
+	for col := 0; col < maxCols; col++ {
+		score := 0
+		for _, row := range rows[startIdx:sampleEnd] {
+			if col >= len(row) {
+				continue
+			}
+			if _, ok := normalizeDomainCandidate(row[col]); ok {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			bestCol = col
+		}
+	}
+
+	return bestCol, startIdx
+}
+
+func normalizeDomainCandidate(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, `"'`)
+	if s == "" {
+		return "", false
+	}
+
+	if strings.Contains(s, "://") {
+		if u, err := url.Parse(s); err == nil {
+			if u.Host != "" {
+				s = u.Host
+			}
+		}
+	}
+
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+
+	if strings.HasPrefix(s, "[") {
+		if end := strings.IndexByte(s, ']'); end > 0 {
+			s = s[1:end]
+			if net.ParseIP(s) != nil {
+				return strings.ToLower(s), true
+			}
+			return "", false
+		}
+	}
+
+	if strings.Contains(s, ":") {
+		host, _, err := net.SplitHostPort(s)
+		if err == nil && host != "" {
+			s = host
+		} else {
+			s = strings.SplitN(s, ":", 2)[0]
+		}
+	}
+
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, ".")
+	s = strings.ToLower(s)
+	if s == "" {
+		return "", false
+	}
+
+	if net.ParseIP(s) != nil {
+		return s, true
+	}
+
+	if len(s) > 253 || !strings.Contains(s, ".") || strings.Contains(s, "..") {
+		return "", false
+	}
+	if strings.HasPrefix(s, "-") || strings.HasSuffix(s, "-") {
+		return "", false
+	}
+
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' {
+			continue
+		}
+		return "", false
+	}
+
+	return s, true
 }
 
 func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, includeBody bool) []byte {

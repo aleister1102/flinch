@@ -29,6 +29,28 @@ To build all tools:
 make build
 ```
 
+### Docker (Optional)
+
+If you want to run the end-to-end fingerprinting flow in a container (including dependency checks), use the provided `Dockerfile`.
+
+Build:
+```bash
+docker build -t httpfuzz .
+```
+
+Run against a single domain (mounting your local training artifacts into the container):
+```bash
+docker run --rm -v "$PWD:/work" httpfuzz example.com
+```
+
+The container expects these to exist on the mounted workspace:
+- `data/map.csv` and `data/vm_unique_*.json` (feature encoding maps)
+- `model_artifacts/model.pkl`, `model_artifacts/scaler.pkl`, `model_artifacts/feature_names.pkl` (trained model artifacts)
+
+It writes outputs under `out/`:
+- `out/features.csv`
+- `out/predictions.csv`
+
 To install Python dependencies:
 
 ```bash
@@ -89,7 +111,7 @@ uv run scripts/puredns_filter_csv.py data/targets.csv -b 500 -s 2
 
 **Example:**
 ```bash
-./bin/survey
+./bin/survey -p http://127.0.0.1:8080 -f data/targets.csv.resolved.csv -w 50
 ```
 Defaults:
 - Input: `data/targets.csv.resolved.csv` if present, else `data/targets.csv`
@@ -117,7 +139,7 @@ uv run scripts/parse_headers.py --input responses --out-dir data
 
 ### 5. Filter Responses (Optional)
 
-Use `filterResponses` to identify domains that did not respond properly or timed out.
+Use `filterResponses` to remove response files for domains that did not respond properly or timed out.
 
 **Arguments:**
 - `-dir`: Path to the directory containing response files.
@@ -138,7 +160,7 @@ Use `features` to parse the raw HTTP responses and extract features into a CSV f
 
 **Example:**
 ```bash
-./bin/features -input responses/ -output dataset.csv
+./bin/features -input responses/ -output data/dataset.csv
 ```
 
 ## Machine Learning & Fingerprinting
@@ -147,22 +169,11 @@ This project includes Python scripts to train a classification model and use it 
 
 ### One-Time Setup (per dataset)
 
-You need a request set and stable ID maps before you can train a model and fingerprint new domains.
-
-```bash
-make build
-
-# Generate fuzzing payloads
-./bin/fuzzy > data/request_set.txt
-
-# Create responses/ for your training domains and run the survey
-mkdir -p responses
-./bin/survey -f data/targets.csv.resolved.csv -C 1 -o responses -r data/request_set.txt
-
-# Generate request-type map + header/status ID maps (used by feature extraction)
-uv run scripts/generate_map.py
-uv run scripts/parse_headers.py --input responses --out-dir data
-```
+Complete steps 1–4 in the Usage Guide so you have:
+- `data/request_set.txt`
+- `responses/`
+- `data/map.csv`
+- `data/vm_unique_*.json`
 
 ### 1. Train the Model
 
@@ -203,27 +214,22 @@ UV_CACHE_DIR="$PWD/.uv_cache" uv run ml/predict.py --input target_features.csv -
 
 The script will output the predicted server type and confidence score.
 
-## Workflow Example
-
-```bash
-# 1. Build the tools
-make build
-
-# 2. Generate payloads
-./bin/fuzzy > data/request_set.txt
-
-# 3. Create a list of target domains (example)
-echo "example.com" > data/targets.csv
-
-# 4. Run the survey (ensure 'responses' dir exists)
-mkdir -p responses
-./bin/survey -f data/targets.csv.resolved.csv -C 1 -o responses
-
-# 5. Extract features
-./bin/features -input responses/ -output results.csv
-```
-
 ## Development
-
 - `make test`: Run tests.
 - `make clean`: Clean up build artifacts.
+
+## Citation
+
+If you use this project in academic work, please cite the original paper:
+
+Kar, A., Natadze, A., Branca, E., and Stakhanova, N. “HTTPFuzz: Web Server Fingerprinting with HTTP Request Fuzzing.” In Proceedings of the 19th International Conference on Security and Cryptography (SECRYPT 2022), pp. 261–271, 2022.
+
+```bibtex
+@inproceedings{kar2022httpfuzz,
+  title     = {HTTPFuzz: Web Server Fingerprinting with HTTP Request Fuzzing},
+  author    = {Kar, Animesh and Natadze, Andrei and Branca, Enrico and Stakhanova, Natalia},
+  booktitle = {Proceedings of the 19th International Conference on Security and Cryptography (SECRYPT 2022)},
+  pages     = {261--271},
+  year      = {2022}
+}
+```

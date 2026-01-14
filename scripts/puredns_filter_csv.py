@@ -2,13 +2,16 @@
 
 import argparse
 import csv
+import ipaddress
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 
 def _build_parser(show_advanced: bool) -> argparse.ArgumentParser:
@@ -37,8 +40,8 @@ def _build_parser(show_advanced: bool) -> argparse.ArgumentParser:
         "-C",
         "--col",
         type=int,
-        default=1,
-        help="1-based column number containing domains",
+        default=None,
+        help="1-based column number containing domains (default: auto-detect)",
     )
     parser.add_argument(
         "-c",
@@ -122,13 +125,103 @@ def _read_csv_rows(path: str) -> list[list[str]]:
         return [row for row in reader if row]
 
 
-def _extract_domains(rows: list[list[str]], col_idx: int) -> list[str]:
+_DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$", re.IGNORECASE)
+
+
+def _normalize_domain_candidate(value: str) -> str | None:
+    s = value.strip().strip('"').strip("'")
+    if not s:
+        return None
+
+    if "://" in s:
+        try:
+            parts = urlsplit(s)
+            if parts.hostname:
+                s = parts.hostname
+            elif parts.netloc:
+                s = parts.netloc
+        except Exception:
+            pass
+
+    if "/" in s:
+        s = s.split("/", 1)[0]
+
+    if ":" in s and not s.startswith("["):
+        s = s.split(":", 1)[0]
+
+    s = s.strip().strip(".").lower()
+    if not s:
+        return None
+
+    try:
+        ipaddress.ip_address(s)
+        return s
+    except ValueError:
+        pass
+
+    if len(s) > 253:
+        return None
+    if "." not in s:
+        return None
+    if ".." in s:
+        return None
+    if not _DOMAIN_RE.match(s):
+        return None
+    if s.startswith("-") or s.endswith("-"):
+        return None
+    return s
+
+
+def _looks_like_header(row: list[str]) -> bool:
+    if not row:
+        return False
+    tokens = {"domain", "domains", "host", "hostname", "fqdn", "url", "website", "site"}
+    lowered = [c.strip().lower() for c in row]
+    if any(c in tokens or "domain" in c for c in lowered):
+        return True
+    if sum(1 for c in row if _normalize_domain_candidate(c)) == 0:
+        return True
+    return False
+
+
+def _choose_domain_col(rows: list[list[str]]) -> tuple[int, int]:
+    max_cols = max((len(r) for r in rows), default=0)
+    if max_cols == 0:
+        return 0, 0
+
+    start_idx = 0
+    header = rows[0] if rows else []
+    if header and _looks_like_header(header) and len(rows) > 1:
+        tokens = {"domain", "domains", "host", "hostname", "fqdn"}
+        for idx, cell in enumerate(header):
+            c = cell.strip().lower()
+            if c in tokens or c == "url" or "domain" in c:
+                return idx, 1
+        start_idx = 1
+
+    best_idx = 0
+    best_score = -1
+    sample = rows[start_idx : start_idx + 250]
+    for col in range(max_cols):
+        score = 0
+        for row in sample:
+            if col >= len(row):
+                continue
+            if _normalize_domain_candidate(row[col]):
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_idx = col
+    return best_idx, start_idx
+
+
+def _extract_domains(rows: list[list[str]], col_idx: int, start_idx: int) -> list[str]:
     domains: list[str] = []
     seen: set[str] = set()
-    for row in rows:
+    for row in rows[start_idx:]:
         if col_idx >= len(row):
             continue
-        domain = row[col_idx].strip()
+        domain = _normalize_domain_candidate(row[col_idx])
         if not domain or domain in seen:
             continue
         seen.add(domain)
@@ -240,17 +333,23 @@ def main() -> int:
     input_csv = args.input_csv or args.input
     output_csv = args.output_csv or args.output
 
-    if args.col < 1:
-        print("error: -C/--col must be >= 1", file=sys.stderr)
-        return 2
-
     rows = _read_csv_rows(input_csv)
     if not rows:
         print("error: input CSV is empty", file=sys.stderr)
         return 2
 
-    col_idx = args.col - 1
-    domains = _extract_domains(rows, col_idx)
+    start_idx = 0
+    if args.col is not None:
+        if args.col < 1:
+            print("error: -C/--col must be >= 1", file=sys.stderr)
+            return 2
+        col_idx = args.col - 1
+        if _looks_like_header(rows[0]) and len(rows) > 1:
+            start_idx = 1
+    else:
+        col_idx, start_idx = _choose_domain_col(rows)
+
+    domains = _extract_domains(rows, col_idx, start_idx)
     if not domains:
         print("error: no domains found in input CSV", file=sys.stderr)
         return 2
@@ -281,21 +380,29 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 2
 
-    filtered_rows = [row for row in rows if col_idx < len(row) and row[col_idx].strip() in resolved]
+    filtered_rows: list[list[str]] = []
+    for row in rows:
+        if col_idx >= len(row):
+            continue
+        d = _normalize_domain_candidate(row[col_idx])
+        if d and d in resolved:
+            filtered_rows.append(row)
 
     out_path = output_csv or _default_output_path(input_csv)
     _write_csv(out_path, filtered_rows)
 
-    if args.resolved_domains_out:
-        with open(args.resolved_domains_out, "w") as f:
-            for d in sorted(resolved):
-                f.write(d + "\n")
+    resolved_out_path = args.resolved_domains_out
+    if not resolved_out_path:
+        resolved_out_path = str(pathlib.Path(out_path).with_suffix(".txt"))
+    with open(resolved_out_path, "w") as f:
+        for d in sorted(resolved):
+            f.write(d + "\n")
 
     if args.cache:
         _append_domain_cache(args.cache, resolved - cached_resolved)
 
     print(
-        f"input_domains={len(domains)} resolved={len(resolved)} output_rows={len(filtered_rows)} output={out_path}"
+        f"input_domains={len(domains)} resolved={len(resolved)} output_rows={len(filtered_rows)} output={out_path} resolved_domains_out={resolved_out_path}"
     )
     return 0
 

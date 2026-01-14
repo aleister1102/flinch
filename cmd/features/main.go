@@ -101,6 +101,7 @@ func requestMappings(mapPath string) map[string]string {
 	}
 	defer csvFile.Close()
 	csvReader := csv.NewReader(csvFile)
+	csvReader.FieldsPerRecord = -1
 	for {
 		rec, err := csvReader.Read()
 		if err == io.EOF {
@@ -109,9 +110,27 @@ func requestMappings(mapPath string) map[string]string {
 		if err != nil {
 			log.Fatal(err)
 		}
-		requests[rec[6]] = rec[7]
+		if len(rec) == 0 {
+			continue
+		}
+		var k, v string
+		if len(rec) >= 8 {
+			k = strings.TrimSpace(rec[6])
+			v = strings.TrimSpace(rec[7])
+		} else if len(rec) >= 2 {
+			k = strings.TrimSpace(rec[0])
+			v = strings.TrimSpace(rec[1])
+		} else {
+			continue
+		}
+		if k == "" || v == "" {
+			continue
+		}
+		if strings.EqualFold(k, "req_type") && strings.EqualFold(v, "id") {
+			continue
+		}
+		requests[k] = v
 	}
-	// 6 and 7 elements of line array
 	return requests
 }
 
@@ -201,17 +220,19 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 	nmapFile, err := os.Open(filepath.Join(dataDir, "nmap_results_80_clean_all.csv"))
 
 	if err != nil {
-		log.Fatal(err)
-	}
-	defer nmapFile.Close()
-	nmapLines, err := csv.NewReader(nmapFile).ReadAll()
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for _, line := range nmapLines {
-		nmapResults[line[0]] = line[1]
+		nmapResults = map[string]string{}
+	} else {
+		defer nmapFile.Close()
+		nmapLines, err := csv.NewReader(nmapFile).ReadAll()
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, line := range nmapLines {
+			if len(line) < 2 {
+				continue
+			}
+			nmapResults[line[0]] = line[1]
+		}
 	}
 
 	resFile, err := os.OpenFile(pathToCSV, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
@@ -223,9 +244,11 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 	defer csvWriter.Flush()
 
 	filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
-		fileInfo, err2 := os.Stat(path)
-		if err2 != nil {
-			log.Fatal(err2)
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
 		}
 
 		var statusCode string
@@ -242,7 +265,7 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 		var hasBody bool
 		var hasStatusCode bool
 		var hasStatusMessage bool
-		fileName := filepath.Base(path)
+		fileName := info.Name()
 
 		if _, ok := nmapResults[strings.ToLower(fileName)]; ok {
 			foundNmap++
@@ -250,192 +273,200 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 
 		} else {
 			nmapValue = "no_nmap_result"
-			// return nil //comment if don't wanna skip files for some reason for vms
 		}
-		if !fileInfo.IsDir() || fileInfo == nil {
-			f, err := os.ReadFile(path)
-			if err != nil {
-				log.Fatal(err)
-			}
-			fileString := string(f)
+		f, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fileString := string(f)
 
-			records := parseSurveyJSONL(fileString)
-			if len(records) == 0 {
-				skipped++
+		records := parseSurveyJSONL(fileString)
+		if len(records) == 0 {
+			skipped++
+			return nil
+		}
+
+		for _, rec := range records {
+			var csvFields []string
+			statusCode, statusMessage, headers, serverValue, hasBody, headerValues, reqLine, redirected = stringManipulationJSON(rec)
+			if redirected {
+				redirectedCount++
 				return nil
 			}
+			if !IsNumbers(statusCode) {
+				skipped++
+				continue
+			}
+			serverValue2 = append(serverValue2, serverValue...)
 
-			for _, rec := range records {
-				var csvFields []string
-				statusCode, statusMessage, headers, serverValue, hasBody, headerValues, reqLine, redirected = stringManipulationJSON(rec)
-				if redirected {
-					redirectedCount++
-					return nil
-				}
-				if !IsNumbers(statusCode) {
-					skipped++
-					continue
-				}
-				serverValue2 = append(serverValue2, serverValue...)
+			for i := 0; i < len(headers); i++ {
+				if contains(filteredHeaders, headers[i]) {
+					if i == 0 {
+						filteredFound = filteredFound + headers[i]
 
-				for i := 0; i < len(headers); i++ {
-					if contains(filteredHeaders, headers[i]) {
-						if i == 0 {
-							filteredFound = filteredFound + headers[i]
-
-						} else {
-							filteredFound = filteredFound + " " + headers[i]
-						}
 					} else {
-						continue
-					}
-				}
-				if filteredFound == "" {
-					filteredFound = "no_headers"
-				}
-				if filteredFound[:1] == " " {
-					filteredFound = trimLeftChars(filteredFound, 1)
-				}
-				var server string
-				for i := 0; i < len(serverValue2); i++ {
-					if serverValue2[i] != "no_server_header_found" {
-						server = serverValue2[i]
-					} else {
-						continue
-					}
-				}
-				if server == "" {
-					server = "unknown"
-				}
-				var reqType string
-				var reqTypeID string
-				reqLineSlice := strings.Split(reqLine, " ")
-				reqType = reqLineSlice[len(reqLineSlice)-1]
-				if _, ok := typeMap[reqType]; ok {
-					reqTypeID = typeMap[reqType]
-				}
-				csvFields = append(csvFields, fileName)
-				csvFields = append(csvFields, reqLine)
-				parentType := strings.Split(reqType, "_")
-				csvFields = append(csvFields, parentType[0])
-				if len(parentType) <= 1 {
-					csvFields = append(csvFields, parentType[0])
-				} else {
-					csvFields = append(csvFields, parentType[0]+"_"+parentType[1])
-				}
-
-				csvFields = append(csvFields, reqTypeID)
-
-				if _, ok := filteredHeadersID[filteredFound]; !ok {
-					filteredHeadersID[filteredFound] = filteredHeadersIDCounter
-					filteredHeadersIDCounter++
-				}
-
-				if _, ok := msgID[statusMessage]; !ok {
-					if statusMessage != "no_status_message" {
-						msgID[statusMessage] = max(msgID) + 1
-					} else {
-						msgID[statusMessage] = 10000
-					}
-				}
-
-				if _, ok := codeID[statusCode]; !ok {
-					if statusMessage != "no_status_message" {
-						codeID[statusCode] = max(codeID) + 1
-					} else {
-						codeID[statusCode] = 10000
-					}
-				}
-
-				csvFields = append(csvFields, strconv.Itoa(filteredHeadersID[filteredFound]))
-				csvFields = append(csvFields, strconv.Itoa(codeID[statusCode]))
-				csvFields = append(csvFields, strconv.Itoa(msgID[statusMessage]))
-				if hasBody {
-					csvFields = append(csvFields, "1")
-				} else {
-					csvFields = append(csvFields, "0")
-				}
-				if statusCode != "no_status_code" && statusCode != "" {
-					hasStatusCode = true
-				} else {
-					hasStatusCode = false
-				}
-				if statusMessage != "no_status_message" && statusMessage != "" {
-					hasStatusMessage = true
-				} else {
-					hasStatusMessage = false
-				}
-				if hasStatusCode {
-					csvFields = append(csvFields, "1")
-				} else {
-					csvFields = append(csvFields, "0")
-				}
-				if hasStatusMessage {
-					csvFields = append(csvFields, "1")
-				} else {
-					csvFields = append(csvFields, "0")
-				}
-				for _, header := range indHeaders {
-					if contains(headers, header) {
-						for i := range headers {
-							if strings.EqualFold(headers[i], header) {
-								headerValueID := valueID[headerValues[i]]
-								if _, ok := valueID[headerValues[i]]; !ok {
-									valueID[headerValues[i]] = max(valueID) + 1
-								}
-								fieldID := strconv.Itoa(headerID[header])
-								if fieldID == "" || fieldID == " " {
-									fieldID = "10000"
-								}
-								csvFields = append(csvFields, "1")
-								if IsUpper(headers[i]) {
-									csvFields = append(csvFields, "10001")
-								} else if IsLower(headers[i]) {
-									csvFields = append(csvFields, "10002")
-								} else {
-									csvFields = append(csvFields, "10003")
-								}
-								csvFields = append(csvFields, fieldID)
-								if headerValueID == 0 {
-									headerValueID = 10000
-								}
-								csvFields = append(csvFields, strconv.Itoa(headerValueID))
-							}
-						}
-					} else {
-						csvFields = append(csvFields, "0")
-						csvFields = append(csvFields, "10000")
-						csvFields = append(csvFields, "10000")
-						csvFields = append(csvFields, "10000")
-					}
-				}
-				if strings.Contains(server, "/") {
-					noVersion := strings.SplitN(server, "/", 2)
-					csvFields = append(csvFields, strings.Trim(strings.ToLower(noVersion[0]), " "))
-				} else {
-					csvFields = append(csvFields, strings.Trim(strings.ToLower(server), " "))
-				}
-				csvFields = append(csvFields, nmapValue)
-
-				filteredFound = ""
-				if len(csvFields) != lenOfHeaders {
-					skipped++
-					continue
-				}
-				if contains(csvFields, "<") || contains(csvFields, ">") {
-					skipped++
-					continue
-				}
-				if strings.Join(csvFields, "") != "" {
-					if err := csvWriter.Write(csvFields); err != nil {
-						log.Fatal(err)
+						filteredFound = filteredFound + " " + headers[i]
 					}
 				} else {
-					skipped++
 					continue
 				}
 			}
+			if filteredFound == "" {
+				filteredFound = "no_headers"
+			}
+			if filteredFound[:1] == " " {
+				filteredFound = trimLeftChars(filteredFound, 1)
+			}
+			var server string
+			for i := 0; i < len(serverValue2); i++ {
+				if serverValue2[i] != "no_server_header_found" {
+					server = serverValue2[i]
+				} else {
+					continue
+				}
+			}
+			if server == "" {
+				server = "unknown"
+			}
+			var reqType string
+			var reqTypeID string
+			reqLineSlice := strings.Split(reqLine, " ")
+			reqType = reqLineSlice[len(reqLineSlice)-1]
+			if _, ok := typeMap[reqType]; ok {
+				reqTypeID = typeMap[reqType]
+			}
+			csvFields = append(csvFields, fileName)
+			csvFields = append(csvFields, reqLine)
+			parentType := strings.Split(reqType, "_")
+			csvFields = append(csvFields, parentType[0])
+			if len(parentType) <= 1 {
+				csvFields = append(csvFields, parentType[0])
+			} else {
+				csvFields = append(csvFields, parentType[0]+"_"+parentType[1])
+			}
 
+			csvFields = append(csvFields, reqTypeID)
+
+			if _, ok := filteredHeadersID[filteredFound]; !ok {
+				filteredHeadersID[filteredFound] = filteredHeadersIDCounter
+				filteredHeadersIDCounter++
+			}
+
+			if _, ok := msgID[statusMessage]; !ok {
+				if statusMessage != "no_status_message" {
+					next := max(msgID) + 1
+					if next < 10001 {
+						next = 10001
+					}
+					msgID[statusMessage] = next
+				} else {
+					msgID[statusMessage] = 10000
+				}
+			}
+
+			if _, ok := codeID[statusCode]; !ok {
+				if statusMessage != "no_status_message" {
+					next := max(codeID) + 1
+					if next < 10001 {
+						next = 10001
+					}
+					codeID[statusCode] = next
+				} else {
+					codeID[statusCode] = 10000
+				}
+			}
+
+			csvFields = append(csvFields, strconv.Itoa(filteredHeadersID[filteredFound]))
+			csvFields = append(csvFields, strconv.Itoa(codeID[statusCode]))
+			csvFields = append(csvFields, strconv.Itoa(msgID[statusMessage]))
+			if hasBody {
+				csvFields = append(csvFields, "1")
+			} else {
+				csvFields = append(csvFields, "0")
+			}
+			if statusCode != "no_status_code" && statusCode != "" {
+				hasStatusCode = true
+			} else {
+				hasStatusCode = false
+			}
+			if statusMessage != "no_status_message" && statusMessage != "" {
+				hasStatusMessage = true
+			} else {
+				hasStatusMessage = false
+			}
+			if hasStatusCode {
+				csvFields = append(csvFields, "1")
+			} else {
+				csvFields = append(csvFields, "0")
+			}
+			if hasStatusMessage {
+				csvFields = append(csvFields, "1")
+			} else {
+				csvFields = append(csvFields, "0")
+			}
+			for _, header := range indHeaders {
+				if contains(headers, header) {
+					for i := range headers {
+						if strings.EqualFold(headers[i], header) {
+							if _, ok := valueID[headerValues[i]]; !ok {
+								next := max(valueID) + 1
+								if next < 10001 {
+									next = 10001
+								}
+								valueID[headerValues[i]] = next
+							}
+							headerValueID := valueID[headerValues[i]]
+							fieldID := strconv.Itoa(headerID[header])
+							if fieldID == "" || fieldID == " " {
+								fieldID = "10000"
+							}
+							csvFields = append(csvFields, "1")
+							if IsUpper(headers[i]) {
+								csvFields = append(csvFields, "10001")
+							} else if IsLower(headers[i]) {
+								csvFields = append(csvFields, "10002")
+							} else {
+								csvFields = append(csvFields, "10003")
+							}
+							csvFields = append(csvFields, fieldID)
+							if headerValueID == 0 {
+								headerValueID = 10000
+							}
+							csvFields = append(csvFields, strconv.Itoa(headerValueID))
+						}
+					}
+				} else {
+					csvFields = append(csvFields, "0")
+					csvFields = append(csvFields, "10000")
+					csvFields = append(csvFields, "10000")
+					csvFields = append(csvFields, "10000")
+				}
+			}
+			if strings.Contains(server, "/") {
+				noVersion := strings.SplitN(server, "/", 2)
+				csvFields = append(csvFields, strings.Trim(strings.ToLower(noVersion[0]), " "))
+			} else {
+				csvFields = append(csvFields, strings.Trim(strings.ToLower(server), " "))
+			}
+			csvFields = append(csvFields, nmapValue)
+
+			filteredFound = ""
+			if len(csvFields) != lenOfHeaders {
+				skipped++
+				continue
+			}
+			if contains(csvFields, "<") || contains(csvFields, ">") {
+				skipped++
+				continue
+			}
+			if strings.Join(csvFields, "") != "" {
+				if err := csvWriter.Write(csvFields); err != nil {
+					log.Fatal(err)
+				}
+			} else {
+				skipped++
+				continue
+			}
 		}
 
 		return nil

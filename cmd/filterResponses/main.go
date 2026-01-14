@@ -24,49 +24,63 @@ func main() {
 }
 
 func findNonRespondants(path string) {
-	filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
-		fileInfo, err2 := os.Stat(path)
-		if err2 != nil {
-			log.Fatal(err2)
+	filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
 		}
-		if !fileInfo.IsDir() || fileInfo == nil {
-			fileName := filepath.Base(path)
-			f, err := os.ReadFile(path)
-			if err != nil {
-				log.Fatal(err)
-			}
-			fileString := string(f)
-			trimmed := strings.TrimSpace(fileString)
-			if trimmed == "" || trimmed[0] != '{' {
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
+		fileName := filepath.Base(filePath)
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("read %s: %v", fileName, err)
+			return nil
+		}
+
+		fileString := string(b)
+		trimmed := strings.TrimSpace(fileString)
+		if trimmed == "" || trimmed[0] != '{' {
+			if err := os.Remove(filePath); err != nil {
+				log.Printf("remove %s: %v", fileName, err)
+			} else {
 				fmt.Println(fileName)
-				return nil
 			}
+			return nil
+		}
 
-			type rec struct {
-				Error    string `json:"error"`
-				Response *struct {
-					StatusCode int `json:"status_code"`
-				} `json:"response"`
+		type rec struct {
+			Error    string `json:"error"`
+			Response *struct {
+				StatusCode int `json:"status_code"`
+			} `json:"response"`
+		}
+
+		total := 0
+		success := 0
+		for _, line := range strings.Split(fileString, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
 			}
-
-			total := 0
-			success := 0
-			for _, line := range strings.Split(fileString, "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				total++
-				var r rec
-				if err := json.Unmarshal([]byte(line), &r); err != nil {
-					continue
-				}
-				if r.Error == "" && r.Response != nil && r.Response.StatusCode > 0 {
-					success++
-				}
+			total++
+			var r rec
+			if err := json.Unmarshal([]byte(line), &r); err != nil {
+				continue
 			}
+			if r.Error == "" && r.Response != nil && r.Response.StatusCode > 0 {
+				success++
+			}
+		}
 
-			if total == 0 || success == 0 {
+		if total == 0 || success == 0 {
+			if err := os.Remove(filePath); err != nil {
+				log.Printf("remove %s: %v", fileName, err)
+			} else {
 				fmt.Println(fileName)
 			}
 		}
