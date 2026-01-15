@@ -141,6 +141,8 @@ func main() {
 	proxyFlag := flag.String("p", "", "proxy URL (e.g., http://127.0.0.1:8080)")
 	includeBody := flag.Bool("B", false, "include response body in output (slower)")
 	outputFormat := flag.String("format", "jsonl", "output format: jsonl or parquet")
+	cacheEnabled := flag.Bool("cache", true, "enable on-disk caching")
+	cacheDir := flag.String("cache-dir", ".cache/httpfuzz/survey", "path to cache directory")
 	flag.Parse()
 
 	if strings.TrimSpace(*csvParam) == "" {
@@ -180,6 +182,15 @@ func main() {
 	fuzzLines, err := readFuzzFile(*requestsFlag)
 	if err != nil {
 		log.Fatalf("failed to read fuzz file: %v", err)
+	}
+
+	if *cacheEnabled {
+		if err := os.MkdirAll(*cacheDir, 0o755); err != nil {
+			log.Fatalf("failed to create cache dir %s: %v", *cacheDir, err)
+		}
+		if err := loadDNSCache(filepath.Join(*cacheDir, "dns.json")); err != nil {
+			log.Printf("failed to load dns cache: %v", err)
+		}
 	}
 
 	totalRequests := len(domainList) * len(fuzzLines)
@@ -225,12 +236,18 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			processDomain(d, fuzzLines, *outputDir, *outputFormat, fastClient, proxyURL, *timeout, *perDomainWorkers, *includeBody, bar)
+			processDomain(d, fuzzLines, *outputDir, *outputFormat, *cacheEnabled, *cacheDir, fastClient, proxyURL, *timeout, *perDomainWorkers, *includeBody, bar)
 		}(domain)
 	}
 
 	wg.Wait()
 	bar.Finish()
+
+	if *cacheEnabled {
+		if err := saveDNSCache(filepath.Join(*cacheDir, "dns.json")); err != nil {
+			log.Printf("failed to save dns cache: %v", err)
+		}
+	}
 }
 
 func dialDirect(timeout time.Duration) func(addr string) (net.Conn, error) {
@@ -254,6 +271,72 @@ type dnsCacheEntry struct {
 }
 
 var dnsCache sync.Map
+
+func loadDNSCache(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var file map[string][]string
+	if err := json.Unmarshal(b, &file); err != nil {
+		return err
+	}
+	for host, ips := range file {
+		if strings.TrimSpace(host) == "" {
+			continue
+		}
+		var out []net.IP
+		for _, ipStr := range ips {
+			ip := net.ParseIP(strings.TrimSpace(ipStr))
+			if ip == nil || !isPublicIP(ip) {
+				continue
+			}
+			out = append(out, ip)
+		}
+		if len(out) == 0 {
+			continue
+		}
+		dnsCache.Store(host, dnsCacheEntry{ips: out})
+	}
+	return nil
+}
+
+func saveDNSCache(path string) error {
+	out := make(map[string][]string)
+	dnsCache.Range(func(k, v any) bool {
+		host, ok := k.(string)
+		if !ok || strings.TrimSpace(host) == "" {
+			return true
+		}
+		e := v.(dnsCacheEntry)
+		if len(e.ips) == 0 {
+			return true
+		}
+		ips := make([]string, 0, len(e.ips))
+		for _, ip := range e.ips {
+			if ip == nil || !isPublicIP(ip) {
+				continue
+			}
+			ips = append(ips, ip.String())
+		}
+		if len(ips) > 0 {
+			out[host] = ips
+		}
+		return true
+	})
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
 
 func isPublicIP(ip net.IP) bool {
 	if ip == nil {
@@ -484,7 +567,7 @@ func readFuzzFile(filename string) ([]fuzzRequest, error) {
 	return fuzzLines, nil
 }
 
-func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, outputFormat string, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, workers int, includeBody bool, bar *pb.ProgressBar) {
+func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, outputFormat string, cacheEnabled bool, cacheDir string, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, workers int, includeBody bool, bar *pb.ProgressBar) {
 	// Sanitize domain name for filename
 	safeName := strings.ReplaceAll(domain, "/", "_")
 	safeName = strings.ReplaceAll(safeName, ":", "_")
@@ -500,6 +583,15 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, out
 	}
 	defer file.Close()
 
+	var cache map[string][]byte
+	if cacheEnabled {
+		cacheFile := cacheRecordsPath(cacheDir, safeName, includeBody)
+		cache, _ = loadSurveyRecordCache(cacheFile)
+		if cache == nil {
+			cache = make(map[string][]byte)
+		}
+	}
+
 	if workers < 1 {
 		workers = 1
 	}
@@ -513,15 +605,28 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, out
 		go func() {
 			defer workerWG.Done()
 			for fr := range tasks {
-				storeBodyAsB64 := !strings.EqualFold(strings.TrimSpace(outputFormat), "parquet")
-				results <- executeFuzz(domain, fr, client, proxyURL, timeout, includeBody, storeBodyAsB64)
+				parquetOutput := strings.EqualFold(strings.TrimSpace(outputFormat), "parquet")
+				writeBodyB64 := cacheEnabled || !parquetOutput
+				results <- executeFuzz(domain, fr, client, proxyURL, timeout, includeBody, writeBodyB64)
 				bar.Increment()
 			}
 		}()
 	}
 
-	go func() {
+	missing := make([]fuzzRequest, 0, len(fuzzLines))
+	if cacheEnabled {
 		for _, fr := range fuzzLines {
+			if line, ok := cache[fr.raw]; ok && len(line) > 0 {
+				continue
+			}
+			missing = append(missing, fr)
+		}
+	} else {
+		missing = append(missing, fuzzLines...)
+	}
+
+	go func() {
+		for _, fr := range missing {
 			tasks <- fr
 		}
 		close(tasks)
@@ -534,23 +639,151 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, out
 		pqWriter := parquet.NewGenericWriter[surveyParquetRow](file, parquet.Compression(&zstd.Codec{}))
 		defer pqWriter.Close()
 
+		for _, fr := range fuzzLines {
+			if !cacheEnabled {
+				break
+			}
+			line := cache[fr.raw]
+			if len(line) == 0 {
+				continue
+			}
+			rec, err := surveyRecordFromCacheJSONLine(line, includeBody)
+			if err != nil {
+				continue
+			}
+			if includeBody {
+				hydrateBodyBytes(&rec)
+			}
+			row, err := toSurveyParquetRow(rec)
+			if err != nil {
+				continue
+			}
+			_, _ = pqWriter.Write([]surveyParquetRow{row})
+			bar.Increment()
+		}
+
 		for rec := range results {
 			row, err := toSurveyParquetRow(rec)
 			if err != nil {
 				continue
 			}
 			_, _ = pqWriter.Write([]surveyParquetRow{row})
+
+			if cacheEnabled {
+				cacheFile := cacheRecordsPath(cacheDir, safeName, includeBody)
+				line := mustMarshalJSON(rec)
+				_ = appendCacheLine(cacheFile, line)
+				cache[rec.Request.Raw] = append([]byte(nil), line...)
+			}
 		}
 	default:
 		writer := bufio.NewWriter(file)
+		if cacheEnabled {
+			for _, fr := range fuzzLines {
+				line := cache[fr.raw]
+				if len(line) == 0 {
+					continue
+				}
+				writer.Write(line)
+				writer.WriteByte('\n')
+				bar.Increment()
+			}
+		}
 		for rec := range results {
 			res := mustMarshalJSON(rec)
 			res = sanitizeJSONLLine(res)
 			writer.Write(res)
 			writer.WriteByte('\n')
+			if cacheEnabled {
+				cacheFile := cacheRecordsPath(cacheDir, safeName, includeBody)
+				_ = appendCacheLine(cacheFile, res)
+				cache[rec.Request.Raw] = append([]byte(nil), res...)
+			}
 		}
 		writer.Flush()
 	}
+}
+
+func cacheRecordsPath(cacheDir, safeName string, includeBody bool) string {
+	name := safeName
+	if includeBody {
+		name = name + ".body"
+	}
+	return filepath.Join(cacheDir, "records", name+".jsonl")
+}
+
+func loadSurveyRecordCache(path string) (map[string][]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string][]byte{}, nil
+		}
+		return nil, err
+	}
+
+	out := make(map[string][]byte)
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Request struct {
+				Raw string `json:"raw"`
+			} `json:"request"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if strings.TrimSpace(rec.Request.Raw) == "" {
+			continue
+		}
+		out[rec.Request.Raw] = []byte(line)
+	}
+	return out, nil
+}
+
+func appendCacheLine(path string, line []byte) error {
+	if len(line) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(line); err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte("\n")); err != nil {
+		return err
+	}
+	return nil
+}
+
+func surveyRecordFromCacheJSONLine(line []byte, includeBody bool) (surveyRecord, error) {
+	var rec surveyRecord
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return surveyRecord{}, err
+	}
+	if includeBody {
+		hydrateBodyBytes(&rec)
+	}
+	return rec, nil
+}
+
+func hydrateBodyBytes(rec *surveyRecord) {
+	if rec == nil || rec.Resp == nil || len(rec.Resp.Body) > 0 || rec.Resp.BodyB64 == "" {
+		return
+	}
+	b, err := base64.StdEncoding.DecodeString(rec.Resp.BodyB64)
+	if err != nil || len(b) == 0 {
+		return
+	}
+	rec.Resp.Body = b
 }
 
 func looksLikeHeader(row []string) bool {
@@ -695,7 +928,7 @@ func normalizeDomainCandidate(raw string) (string, bool) {
 	return s, true
 }
 
-func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, includeBody bool, storeBodyAsB64 bool) surveyRecord {
+func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, includeBody bool, writeBodyB64 bool) surveyRecord {
 	rec := surveyRecord{
 		Domain: domain,
 		Request: requestJSON{
@@ -751,10 +984,9 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 			out.Headers = append(out.Headers, headerKV{K: string(k), V: string(v)})
 		})
 		if includeBody {
-			if storeBodyAsB64 {
-				out.BodyB64 = base64.StdEncoding.EncodeToString(resp.Body())
-			} else {
-				out.Body = append(out.Body[:0], resp.Body()...)
+			out.Body = append(out.Body[:0], resp.Body()...)
+			if writeBodyB64 {
+				out.BodyB64 = base64.StdEncoding.EncodeToString(out.Body)
 			}
 		}
 		rec.Resp = out
@@ -843,7 +1075,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 			rec.Error = err.Error()
 			return rec
 		}
-		out := parseRawHTTPResponse(buf.Bytes(), true, storeBodyAsB64)
+		out := parseRawHTTPResponse(buf.Bytes(), true, writeBodyB64)
 		rec.Resp = out
 		return rec
 	}
@@ -856,7 +1088,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 		rec.Error = err.Error()
 		return rec
 	}
-	out := parseRawHTTPResponse(headerBytes, false, storeBodyAsB64)
+	out := parseRawHTTPResponse(headerBytes, false, writeBodyB64)
 	rec.Resp = out
 	return rec
 }
@@ -903,7 +1135,7 @@ func mustMarshalJSON(v any) []byte {
 	return sanitizeJSONLLine(out)
 }
 
-func parseRawHTTPResponse(raw []byte, includesBody bool, storeBodyAsB64 bool) *responseJSON {
+func parseRawHTTPResponse(raw []byte, includesBody bool, writeBodyB64 bool) *responseJSON {
 	headerPart := raw
 	var body []byte
 	if includesBody {
@@ -949,10 +1181,9 @@ func parseRawHTTPResponse(raw []byte, includesBody bool, storeBodyAsB64 bool) *r
 	}
 
 	if includesBody && len(body) > 0 {
-		if storeBodyAsB64 {
-			out.BodyB64 = base64.StdEncoding.EncodeToString(body)
-		} else {
-			out.Body = append(out.Body[:0], body...)
+		out.Body = append(out.Body[:0], body...)
+		if writeBodyB64 {
+			out.BodyB64 = base64.StdEncoding.EncodeToString(out.Body)
 		}
 	}
 	return out
