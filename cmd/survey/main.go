@@ -194,7 +194,6 @@ type dnsCacheEntry struct {
 }
 
 var dnsCache sync.Map
-var lastDialedIP sync.Map
 
 func isPublicIP(ip net.IP) bool {
 	if ip == nil {
@@ -204,13 +203,6 @@ func isPublicIP(ip net.IP) bool {
 		return false
 	}
 	return ip.IsGlobalUnicast()
-}
-
-func getLastDialedIP(host string) string {
-	if v, ok := lastDialedIP.Load(host); ok {
-		return v.(string)
-	}
-	return ""
 }
 
 func resolvePublicIPs(host string, timeout time.Duration) ([]net.IP, error) {
@@ -270,7 +262,6 @@ func safeDialAddr(d *net.Dialer, addr string, timeout time.Duration) (net.Conn, 
 	for _, ip := range ips {
 		c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
 		if err == nil {
-			lastDialedIP.Store(host, ip.String())
 			return c, nil
 		}
 		lastErr = err
@@ -462,9 +453,6 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, cli
 			defer workerWG.Done()
 			for fr := range tasks {
 				results <- executeFuzz(domain, fr, client, proxyURL, timeout, includeBody)
-				if ip := getLastDialedIP(domain); ip != "" {
-					bar.Postfix(ip)
-				}
 				bar.Increment()
 			}
 		}()
