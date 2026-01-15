@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -238,6 +239,21 @@ def _run_puredns_resolve(
         )
 
     puredns_args = shlex.split(extra_args) if extra_args.strip() else []
+    massdns_out_path: str | None = None
+    for i, a in enumerate(puredns_args):
+        if a == "--write-massdns" and i + 1 < len(puredns_args):
+            massdns_out_path = puredns_args[i + 1]
+            break
+        if a.startswith("--write-massdns="):
+            massdns_out_path = a.split("=", 1)[1].strip() or None
+            break
+
+    created_temp_massdns = False
+    if not massdns_out_path:
+        massdns_out_path = tempfile.mkstemp(prefix="puredns_massdns_", suffix=".txt")[1]
+        created_temp_massdns = True
+        puredns_args.extend(["--write-massdns", massdns_out_path])
+
     has_bin = any(
         a == "--bin" or a.startswith("--bin=")
         for a in puredns_args
@@ -285,26 +301,224 @@ def _run_puredns_resolve(
         d = line.strip()
         if d:
             resolved.add(d)
-    return resolved
+
+    allowed: set[str] = set(resolved)
+    if massdns_out_path:
+        domain_ip_has_public: dict[str, bool] = {}
+        domain_ip_has_any: dict[str, bool] = {}
+        try:
+            with open(massdns_out_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    rr_name = parts[0].rstrip(".").lower()
+                    rr_type = parts[1].upper()
+                    if rr_type not in {"A", "AAAA"}:
+                        continue
+                    rr_value = parts[2].strip().rstrip(".")
+                    try:
+                        ip = ipaddress.ip_address(rr_value)
+                    except ValueError:
+                        continue
+                    domain_ip_has_any[rr_name] = True
+                    if not (ip.is_private or ip.is_loopback):
+                        domain_ip_has_public[rr_name] = True
+        except FileNotFoundError:
+            domain_ip_has_public = {}
+            domain_ip_has_any = {}
+
+        filtered: set[str] = set()
+        for d in resolved:
+            key = d.rstrip(".").lower()
+            if domain_ip_has_any.get(key) and not domain_ip_has_public.get(key, False):
+                filtered.add(d)
+
+        if filtered:
+            allowed = allowed - filtered
+
+        if created_temp_massdns:
+            try:
+                os.remove(massdns_out_path)
+            except Exception:
+                pass
+
+    return allowed
 
 
-def _read_domain_cache(path: str) -> set[str]:
+def _read_domain_cache(path: str) -> dict[str, str]:
     try:
         with open(path) as f:
-            return {line.strip() for line in f if line.strip()}
+            out: dict[str, str] = {}
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if "," in line:
+                    orig, canon = line.split(",", 1)
+                    orig = orig.strip()
+                    canon = canon.strip()
+                    if orig and canon:
+                        out[orig] = canon
+                    continue
+                out[line] = line
+            return out
     except FileNotFoundError:
-        return set()
+        return {}
 
 
-def _append_domain_cache(path: str, domains: set[str]) -> None:
+def _append_domain_cache(path: str, domains: dict[str, str]) -> None:
     if not domains:
         return
     parent = pathlib.Path(path).parent
     if str(parent) and not parent.exists():
         parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
-        for d in sorted(domains):
-            f.write(d + "\n")
+        for orig in sorted(domains):
+            canon = domains.get(orig, orig)
+            if canon and canon != orig:
+                f.write(f"{orig},{canon}\n")
+            else:
+                f.write(orig + "\n")
+
+
+def _resolve_with_cname_follow(
+    puredns_bin: str, domains: list[str], extra_args: str
+) -> dict[str, str]:
+    if not domains:
+        return {}
+
+    puredns_args = shlex.split(extra_args) if extra_args.strip() else []
+    massdns_out_path: str | None = None
+    for i, a in enumerate(puredns_args):
+        if a == "--write-massdns" and i + 1 < len(puredns_args):
+            massdns_out_path = puredns_args[i + 1]
+            break
+        if a.startswith("--write-massdns="):
+            massdns_out_path = a.split("=", 1)[1].strip() or None
+            break
+
+    created_temp_massdns = False
+    if not massdns_out_path:
+        massdns_out_path = tempfile.mkstemp(prefix="puredns_massdns_", suffix=".txt")[1]
+        created_temp_massdns = True
+        puredns_args.extend(["--write-massdns", massdns_out_path])
+
+    has_bin = any(a == "--bin" or a.startswith("--bin=") for a in puredns_args)
+    massdns_path = shutil.which("massdns")
+    if not has_bin and massdns_path:
+        puredns_args.extend(["--bin", massdns_path])
+
+    cmd = [puredns_bin, "resolve", "-q", *puredns_args]
+
+    proc = subprocess.run(
+        cmd,
+        input=("\n".join(domains) + "\n").encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.decode(errors="replace").strip()
+        if "unable to execute massdns" in stderr_text and "exec format error" in stderr_text:
+            if massdns_path and not has_bin:
+                raise RuntimeError(
+                    "puredns resolve failed:\n"
+                    + stderr_text
+                    + "\n\n"
+                    + "Detected massdns in PATH but puredns still failed.\n"
+                    + f"Tried passing: --bin {massdns_path}\n"
+                )
+            raise RuntimeError(
+                "puredns resolve failed:\n"
+                + stderr_text
+                + "\n\n"
+                + "This usually means massdns is missing or built for the wrong OS/CPU.\n"
+                + "Fix:\n"
+                + "- Install/compile massdns for your machine and ensure it runs.\n"
+                + '- Then rerun with: --help-all and pass e.g. -a "--bin /path/to/massdns"\n'
+            )
+        raise RuntimeError("puredns resolve failed:\n" + stderr_text)
+
+    resolved: list[str] = []
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        d = line.strip()
+        if d:
+            resolved.append(d)
+
+    cname_map: dict[str, str] = {}
+    domain_ip_has_public: dict[str, bool] = {}
+    domain_ip_has_any: dict[str, bool] = {}
+
+    if massdns_out_path:
+        try:
+            with open(massdns_out_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    rr_name = parts[0].rstrip(".").lower()
+                    rr_type = parts[1].upper()
+                    rr_value = parts[2].strip().rstrip(".")
+
+                    if rr_type in {"A", "AAAA"}:
+                        try:
+                            ip = ipaddress.ip_address(rr_value)
+                        except ValueError:
+                            continue
+                        domain_ip_has_any[rr_name] = True
+                        if not (ip.is_private or ip.is_loopback):
+                            domain_ip_has_public[rr_name] = True
+                        continue
+
+                    if rr_type == "CNAME":
+                        target = rr_value.rstrip(".").lower()
+                        if target and target != rr_name and rr_name not in cname_map:
+                            cname_map[rr_name] = target
+                        continue
+        except FileNotFoundError:
+            cname_map = {}
+            domain_ip_has_public = {}
+            domain_ip_has_any = {}
+
+        if created_temp_massdns:
+            try:
+                os.remove(massdns_out_path)
+            except Exception:
+                pass
+
+    def follow(name: str) -> str | None:
+        cur = name.rstrip(".").lower()
+        seen: set[str] = set()
+        for _ in range(10):
+            if cur in seen:
+                return None
+            seen.add(cur)
+            nxt = cname_map.get(cur)
+            if not nxt:
+                return cur
+            cur = nxt
+        return None
+
+    out: dict[str, str] = {}
+    for d in resolved:
+        orig = d.rstrip(".").lower()
+        canon = follow(orig)
+        if not canon:
+            continue
+        if domain_ip_has_any.get(canon, False) and not domain_ip_has_public.get(canon, False):
+            continue
+        if not domain_ip_has_public.get(canon, False):
+            continue
+        out[orig] = canon
+
+    return out
 
 
 def _chunked(values: list[str], chunk_size: int) -> list[list[str]]:
@@ -361,19 +575,19 @@ def main() -> int:
         print("error: --sleep-seconds must be >= 0", file=sys.stderr)
         return 2
 
-    cached_resolved: set[str] = set()
+    cached_resolved: dict[str, str] = {}
     if args.cache:
         cached_resolved = _read_domain_cache(args.cache)
 
     try:
         to_query = [d for d in domains if d not in cached_resolved]
-        resolved = set(cached_resolved)
+        resolved_map = dict(cached_resolved)
 
         batches = _chunked(to_query, args.batch_size)
         for idx, batch in enumerate(batches):
             if not batch:
                 continue
-            resolved.update(_run_puredns_resolve(args.puredns, batch, args.puredns_args))
+            resolved_map.update(_resolve_with_cname_follow(args.puredns, batch, args.puredns_args))
             if idx != len(batches) - 1 and args.sleep_seconds > 0:
                 time.sleep(args.sleep_seconds)
     except Exception as e:
@@ -381,11 +595,17 @@ def main() -> int:
         return 2
 
     filtered_rows: list[list[str]] = []
-    for row in rows:
+    if start_idx == 1 and rows:
+        filtered_rows.append(rows[0])
+    for row in rows[start_idx:]:
         if col_idx >= len(row):
             continue
         d = _normalize_domain_candidate(row[col_idx])
-        if d and d in resolved:
+        if d and d in resolved_map:
+            canon = resolved_map[d]
+            if canon and canon != d:
+                row = list(row)
+                row[col_idx] = canon
             filtered_rows.append(row)
 
     out_path = output_csv or _default_output_path(input_csv)
@@ -395,14 +615,15 @@ def main() -> int:
     if not resolved_out_path:
         resolved_out_path = str(pathlib.Path(out_path).with_suffix(".txt"))
     with open(resolved_out_path, "w") as f:
-        for d in sorted(resolved):
+        for d in sorted(set(resolved_map.values())):
             f.write(d + "\n")
 
     if args.cache:
-        _append_domain_cache(args.cache, resolved - cached_resolved)
+        new_entries = {k: v for k, v in resolved_map.items() if k not in cached_resolved}
+        _append_domain_cache(args.cache, new_entries)
 
     print(
-        f"input_domains={len(domains)} resolved={len(resolved)} output_rows={len(filtered_rows)} output={out_path} resolved_domains_out={resolved_out_path}"
+        f"input_domains={len(domains)} resolved_public={len(resolved_map)} output_rows={len(filtered_rows)} output={out_path} resolved_domains_out={resolved_out_path}"
     )
     return 0
 
