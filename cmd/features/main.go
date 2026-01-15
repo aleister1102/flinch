@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 var skipped int = 0
@@ -266,21 +268,19 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 		var hasStatusCode bool
 		var hasStatusMessage bool
 		fileName := info.Name()
+		fileBaseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
-		if _, ok := nmapResults[strings.ToLower(fileName)]; ok {
+		if _, ok := nmapResults[strings.ToLower(fileBaseName)]; ok {
 			foundNmap++
-			nmapValue = nmapResults[strings.ToLower(fileName)]
+			nmapValue = nmapResults[strings.ToLower(fileBaseName)]
 
 		} else {
 			nmapValue = "no_nmap_result"
 		}
-		f, err := os.ReadFile(path)
+		records, err := readSurveyRecords(path)
 		if err != nil {
 			log.Fatal(err)
 		}
-		fileString := string(f)
-
-		records := parseSurveyJSONL(fileString)
 		if len(records) == 0 {
 			skipped++
 			return nil
@@ -335,7 +335,7 @@ func parseFiles(path string, pathToCSV string, dataDir string) {
 			if _, ok := typeMap[reqType]; ok {
 				reqTypeID = typeMap[reqType]
 			}
-			csvFields = append(csvFields, fileName)
+			csvFields = append(csvFields, fileBaseName)
 			csvFields = append(csvFields, reqLine)
 			parentType := strings.Split(reqType, "_")
 			csvFields = append(csvFields, parentType[0])
@@ -498,6 +498,76 @@ type surveyJSONRecord struct {
 		} `json:"headers"`
 		BodyB64 string `json:"body_b64"`
 	} `json:"response"`
+}
+
+type surveyParquetRow struct {
+	Domain         string
+	RequestRaw     string
+	RequestMethod  string
+	RequestPath    string
+	RequestProto   string
+	RequestVersion string
+	RequestDesc    string
+	RequestValid   bool
+	HTTP11         bool
+	Error          string
+
+	RespProto       string
+	RespStatusCode  int32
+	RespStatus      string
+	RespHeadersJSON string
+	RespBody        []byte
+}
+
+func readSurveyRecords(filePath string) ([]surveyJSONRecord, error) {
+	if strings.EqualFold(filepath.Ext(filePath), ".parquet") {
+		rows, err := parquet.ReadFile[surveyParquetRow](filePath)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]surveyJSONRecord, 0, len(rows))
+		for _, row := range rows {
+			var rec surveyJSONRecord
+			rec.Domain = row.Domain
+			rec.Error = row.Error
+			rec.Request.Raw = row.RequestRaw
+
+			if row.RespStatusCode != 0 || row.RespStatus != "" || row.RespProto != "" || row.RespHeadersJSON != "" || len(row.RespBody) > 0 {
+				rec.Response = &struct {
+					StatusCode int    `json:"status_code"`
+					Status     string `json:"status"`
+					Headers    []struct {
+						K string `json:"k"`
+						V string `json:"v"`
+					} `json:"headers"`
+					BodyB64 string `json:"body_b64"`
+				}{}
+				rec.Response.StatusCode = int(row.RespStatusCode)
+				rec.Response.Status = row.RespStatus
+
+				if row.RespHeadersJSON != "" {
+					var headers []struct {
+						K string `json:"k"`
+						V string `json:"v"`
+					}
+					_ = json.Unmarshal([]byte(row.RespHeadersJSON), &headers)
+					rec.Response.Headers = headers
+				}
+				if len(row.RespBody) > 0 {
+					rec.Response.BodyB64 = "1"
+				}
+			}
+
+			out = append(out, rec)
+		}
+		return out, nil
+	}
+
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	return parseSurveyJSONL(string(b)), nil
 }
 
 func parseSurveyJSONL(contents string) []surveyJSONRecord {

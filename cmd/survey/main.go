@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/cheggaaa/pb"
+	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/compress/zstd"
 	"github.com/valyala/fasthttp"
 )
 
@@ -61,6 +63,7 @@ type responseJSON struct {
 	Status     string     `json:"status,omitempty"`
 	Headers    []headerKV `json:"headers,omitempty"`
 	BodyB64    string     `json:"body_b64,omitempty"`
+	Body       []byte     `json:"-"`
 }
 
 type surveyRecord struct {
@@ -69,6 +72,62 @@ type surveyRecord struct {
 	HTTP11  bool          `json:"http11"`
 	Error   string        `json:"error,omitempty"`
 	Resp    *responseJSON `json:"response,omitempty"`
+}
+
+type surveyParquetRow struct {
+	Domain         string
+	RequestRaw     string
+	RequestMethod  string
+	RequestPath    string
+	RequestProto   string
+	RequestVersion string
+	RequestDesc    string
+	RequestValid   bool
+	HTTP11         bool
+	Error          string
+
+	RespProto       string
+	RespStatusCode  int32
+	RespStatus      string
+	RespHeadersJSON string
+	RespBody        []byte
+}
+
+func toSurveyParquetRow(rec surveyRecord) (surveyParquetRow, error) {
+	row := surveyParquetRow{
+		Domain:         rec.Domain,
+		RequestRaw:     rec.Request.Raw,
+		RequestMethod:  rec.Request.Method,
+		RequestPath:    rec.Request.Path,
+		RequestProto:   rec.Request.Proto,
+		RequestVersion: rec.Request.Version,
+		RequestDesc:    rec.Request.Desc,
+		RequestValid:   rec.Request.Valid,
+		HTTP11:         rec.HTTP11,
+		Error:          rec.Error,
+	}
+
+	if rec.Resp == nil {
+		return row, nil
+	}
+
+	row.RespProto = rec.Resp.Proto
+	row.RespStatusCode = int32(rec.Resp.StatusCode)
+	row.RespStatus = rec.Resp.Status
+
+	if len(rec.Resp.Headers) > 0 {
+		b, err := json.Marshal(rec.Resp.Headers)
+		if err != nil {
+			return row, err
+		}
+		row.RespHeadersJSON = string(b)
+	}
+
+	if len(rec.Resp.Body) > 0 {
+		row.RespBody = append(row.RespBody[:0], rec.Resp.Body...)
+	}
+
+	return row, nil
 }
 
 func main() {
@@ -81,6 +140,7 @@ func main() {
 	timeout := flag.Duration("t", 10*time.Second, "timeout for each request")
 	proxyFlag := flag.String("p", "", "proxy URL (e.g., http://127.0.0.1:8080)")
 	includeBody := flag.Bool("B", false, "include response body in output (slower)")
+	outputFormat := flag.String("format", "jsonl", "output format: jsonl or parquet")
 	flag.Parse()
 
 	if strings.TrimSpace(*csvParam) == "" {
@@ -165,7 +225,7 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			processDomain(d, fuzzLines, *outputDir, fastClient, proxyURL, *timeout, *perDomainWorkers, *includeBody, bar)
+			processDomain(d, fuzzLines, *outputDir, *outputFormat, fastClient, proxyURL, *timeout, *perDomainWorkers, *includeBody, bar)
 		}(domain)
 	}
 
@@ -424,11 +484,14 @@ func readFuzzFile(filename string) ([]fuzzRequest, error) {
 	return fuzzLines, nil
 }
 
-func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, workers int, includeBody bool, bar *pb.ProgressBar) {
+func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, outputFormat string, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, workers int, includeBody bool, bar *pb.ProgressBar) {
 	// Sanitize domain name for filename
 	safeName := strings.ReplaceAll(domain, "/", "_")
 	safeName = strings.ReplaceAll(safeName, ":", "_")
 	outputPath := filepath.Join(outputDir, safeName)
+	if strings.EqualFold(strings.TrimSpace(outputFormat), "parquet") {
+		outputPath = outputPath + ".parquet"
+	}
 
 	file, err := os.Create(outputPath)
 	if err != nil {
@@ -437,14 +500,12 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, cli
 	}
 	defer file.Close()
 
-	writer := bufio.NewWriter(file)
-
 	if workers < 1 {
 		workers = 1
 	}
 
 	tasks := make(chan fuzzRequest)
-	results := make(chan []byte, workers*2)
+	results := make(chan surveyRecord, workers*2)
 
 	var workerWG sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -452,7 +513,8 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, cli
 		go func() {
 			defer workerWG.Done()
 			for fr := range tasks {
-				results <- executeFuzz(domain, fr, client, proxyURL, timeout, includeBody)
+				storeBodyAsB64 := !strings.EqualFold(strings.TrimSpace(outputFormat), "parquet")
+				results <- executeFuzz(domain, fr, client, proxyURL, timeout, includeBody, storeBodyAsB64)
 				bar.Increment()
 			}
 		}()
@@ -467,12 +529,28 @@ func processDomain(domain string, fuzzLines []fuzzRequest, outputDir string, cli
 		close(results)
 	}()
 
-	for res := range results {
-		res = sanitizeJSONLLine(res)
-		writer.Write(res)
-		writer.WriteByte('\n')
+	switch strings.ToLower(strings.TrimSpace(outputFormat)) {
+	case "parquet":
+		pqWriter := parquet.NewGenericWriter[surveyParquetRow](file, parquet.Compression(&zstd.Codec{}))
+		defer pqWriter.Close()
+
+		for rec := range results {
+			row, err := toSurveyParquetRow(rec)
+			if err != nil {
+				continue
+			}
+			_, _ = pqWriter.Write([]surveyParquetRow{row})
+		}
+	default:
+		writer := bufio.NewWriter(file)
+		for rec := range results {
+			res := mustMarshalJSON(rec)
+			res = sanitizeJSONLLine(res)
+			writer.Write(res)
+			writer.WriteByte('\n')
+		}
+		writer.Flush()
 	}
-	writer.Flush()
 }
 
 func looksLikeHeader(row []string) bool {
@@ -617,7 +695,7 @@ func normalizeDomainCandidate(raw string) (string, bool) {
 	return s, true
 }
 
-func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, includeBody bool) []byte {
+func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyURL *url.URL, timeout time.Duration, includeBody bool, storeBodyAsB64 bool) surveyRecord {
 	rec := surveyRecord{
 		Domain: domain,
 		Request: requestJSON{
@@ -634,7 +712,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 
 	if !fr.valid {
 		rec.Error = "invalid request line"
-		return mustMarshalJSON(rec)
+		return rec
 	}
 
 	if fr.http11 {
@@ -651,7 +729,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 
 		if err := client.DoRedirects(req, resp, 10); err != nil {
 			rec.Error = err.Error()
-			return mustMarshalJSON(rec)
+			return rec
 		}
 
 		proto := resp.Header.Protocol()
@@ -673,10 +751,14 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 			out.Headers = append(out.Headers, headerKV{K: string(k), V: string(v)})
 		})
 		if includeBody {
-			out.BodyB64 = base64.StdEncoding.EncodeToString(resp.Body())
+			if storeBodyAsB64 {
+				out.BodyB64 = base64.StdEncoding.EncodeToString(resp.Body())
+			} else {
+				out.Body = append(out.Body[:0], resp.Body()...)
+			}
 		}
 		rec.Resp = out
-		return mustMarshalJSON(rec)
+		return rec
 	}
 
 	host := domain
@@ -695,7 +777,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 		conn, err = net.DialTimeout("tcp", proxyHost, timeout)
 		if err != nil {
 			rec.Error = err.Error()
-			return mustMarshalJSON(rec)
+			return rec
 		}
 		conn.SetDeadline(time.Now().Add(timeout))
 
@@ -703,7 +785,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 		if _, err := conn.Write([]byte(connectReq)); err != nil {
 			conn.Close()
 			rec.Error = err.Error()
-			return mustMarshalJSON(rec)
+			return rec
 		}
 
 		reader = bufio.NewReader(conn)
@@ -711,7 +793,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 		if err != nil {
 			conn.Close()
 			rec.Error = err.Error()
-			return mustMarshalJSON(rec)
+			return rec
 		}
 		fields := strings.Fields(statusLine)
 		if len(fields) < 2 || fields[1] != "200" {
@@ -723,7 +805,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 			}
 			conn.Close()
 			rec.Error = strings.TrimSpace(statusLine)
-			return mustMarshalJSON(rec)
+			return rec
 		}
 		for {
 			line, err := reader.ReadString('\n')
@@ -736,7 +818,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 		conn, err = safeDialAddr(d, host, timeout)
 		if err != nil {
 			rec.Error = err.Error()
-			return mustMarshalJSON(rec)
+			return rec
 		}
 		conn.SetDeadline(time.Now().Add(timeout))
 	}
@@ -747,7 +829,7 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 
 	if _, err := conn.Write([]byte(rawReq)); err != nil {
 		rec.Error = err.Error()
-		return mustMarshalJSON(rec)
+		return rec
 	}
 
 	if includeBody {
@@ -759,11 +841,11 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 		}
 		if err != nil && buf.Len() == 0 {
 			rec.Error = err.Error()
-			return mustMarshalJSON(rec)
+			return rec
 		}
-		out := parseRawHTTPResponse(buf.Bytes(), true)
+		out := parseRawHTTPResponse(buf.Bytes(), true, storeBodyAsB64)
 		rec.Resp = out
-		return mustMarshalJSON(rec)
+		return rec
 	}
 
 	if reader == nil {
@@ -772,11 +854,11 @@ func executeFuzz(domain string, fr fuzzRequest, client *fasthttp.Client, proxyUR
 	headerBytes, err := readHTTPHeader(reader, 64*1024)
 	if err != nil && len(headerBytes) == 0 {
 		rec.Error = err.Error()
-		return mustMarshalJSON(rec)
+		return rec
 	}
-	out := parseRawHTTPResponse(headerBytes, false)
+	out := parseRawHTTPResponse(headerBytes, false, storeBodyAsB64)
 	rec.Resp = out
-	return mustMarshalJSON(rec)
+	return rec
 }
 
 func buildTargetURL(domain, path string) string {
@@ -821,7 +903,7 @@ func mustMarshalJSON(v any) []byte {
 	return sanitizeJSONLLine(out)
 }
 
-func parseRawHTTPResponse(raw []byte, includesBody bool) *responseJSON {
+func parseRawHTTPResponse(raw []byte, includesBody bool, storeBodyAsB64 bool) *responseJSON {
 	headerPart := raw
 	var body []byte
 	if includesBody {
@@ -867,7 +949,11 @@ func parseRawHTTPResponse(raw []byte, includesBody bool) *responseJSON {
 	}
 
 	if includesBody && len(body) > 0 {
-		out.BodyB64 = base64.StdEncoding.EncodeToString(body)
+		if storeBodyAsB64 {
+			out.BodyB64 = base64.StdEncoding.EncodeToString(body)
+		} else {
+			out.Body = append(out.Body[:0], body...)
+		}
 	}
 	return out
 }

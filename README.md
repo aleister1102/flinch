@@ -119,7 +119,15 @@ Defaults:
 - Requests: `data/request_set.txt`
 - Output: `responses/`
 
-Each output file is JSON lines (one JSON object per request/response).
+Each output file is JSON lines (one JSON object per request/response) by default.
+
+You can also write Parquet for smaller on-disk storage:
+
+```bash
+./bin/survey -f data/targets.csv.resolved.csv -format parquet
+```
+
+When using Parquet, files are written as `responses/<domain>.parquet` with Zstandard (zstd) compression.
 
 ### 4. Generate ID Maps
 
@@ -136,6 +144,7 @@ Scans your collected responses to build unique ID maps for headers and status co
 ```bash
 uv run scripts/parse_headers.py --input responses --out-dir data
 ```
+Note: `parse_headers.py` supports both JSONL and Parquet response files. Parquet parsing requires `pyarrow` (included in `requirements.txt`).
 
 ### 5. Filter Responses (Optional)
 
@@ -148,6 +157,7 @@ Use `filterResponses` to remove response files for domains that did not respond 
 ```bash
 ./bin/filterResponses -dir responses/
 ```
+This command supports both JSONL and Parquet response files.
 
 ### 6. Extract Features
 
@@ -162,6 +172,7 @@ Use `features` to parse the raw HTTP responses and extract features into a CSV f
 ```bash
 ./bin/features -input responses/ -output data/dataset.csv
 ```
+This command supports both JSONL and Parquet response files.
 
 ## Machine Learning & Fingerprinting
 
