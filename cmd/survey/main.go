@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/csv"
@@ -175,7 +176,7 @@ func main() {
 func dialDirect(timeout time.Duration) func(addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout}
 	return func(addr string) (net.Conn, error) {
-		return d.Dial("tcp", addr)
+		return safeDialAddr(d, addr, timeout)
 	}
 }
 
@@ -188,6 +189,89 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+type dnsCacheEntry struct {
+	ips []net.IP
+}
+
+var dnsCache sync.Map
+
+func isPublicIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	return ip.IsGlobalUnicast()
+}
+
+func resolvePublicIPs(host string, timeout time.Duration) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if !isPublicIP(ip) {
+			return nil, fmt.Errorf("blocked non-public IP: %s", host)
+		}
+		return []net.IP{ip}, nil
+	}
+
+	if v, ok := dnsCache.Load(host); ok {
+		e := v.(dnsCacheEntry)
+		if len(e.ips) == 0 {
+			return nil, fmt.Errorf("no public IPs for host: %s", host)
+		}
+		return e.ips, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		dnsCache.Store(host, dnsCacheEntry{ips: nil})
+		return nil, err
+	}
+
+	ips := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		if isPublicIP(a.IP) {
+			ips = append(ips, a.IP)
+		}
+	}
+
+	dnsCache.Store(host, dnsCacheEntry{ips: ips})
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no public IPs for host: %s", host)
+	}
+	return ips, nil
+}
+
+func safeDialAddr(d *net.Dialer, addr string, timeout time.Duration) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	ips, err := resolvePublicIPs(host, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var lastErr error
+	for _, ip := range ips {
+		c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("failed dialing %s", addr)
+	}
+	return nil, lastErr
+}
+
 func dialViaHTTPProxy(proxyURL *url.URL, timeout time.Duration) func(addr string) (net.Conn, error) {
 	proxyHost := proxyURL.Host
 	if !strings.Contains(proxyHost, ":") {
@@ -196,6 +280,13 @@ func dialViaHTTPProxy(proxyURL *url.URL, timeout time.Duration) func(addr string
 
 	d := &net.Dialer{Timeout: timeout}
 	return func(addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil {
+			if ip := net.ParseIP(host); ip != nil && !isPublicIP(ip) {
+				return nil, fmt.Errorf("blocked non-public IP: %s", host)
+			}
+		}
+
 		conn, err := d.Dial("tcp", proxyHost)
 		if err != nil {
 			return nil, err
@@ -476,7 +567,10 @@ func normalizeDomainCandidate(raw string) (string, bool) {
 	if strings.HasPrefix(s, "[") {
 		if end := strings.IndexByte(s, ']'); end > 0 {
 			s = s[1:end]
-			if net.ParseIP(s) != nil {
+			if ip := net.ParseIP(s); ip != nil {
+				if !isPublicIP(ip) {
+					return "", false
+				}
 				return strings.ToLower(s), true
 			}
 			return "", false
@@ -499,7 +593,10 @@ func normalizeDomainCandidate(raw string) (string, bool) {
 		return "", false
 	}
 
-	if net.ParseIP(s) != nil {
+	if ip := net.ParseIP(s); ip != nil {
+		if !isPublicIP(ip) {
+			return "", false
+		}
 		return s, true
 	}
 

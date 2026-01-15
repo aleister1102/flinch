@@ -155,8 +155,10 @@ def _normalize_domain_candidate(value: str) -> str | None:
         return None
 
     try:
-        ipaddress.ip_address(s)
-        return s
+        ip = ipaddress.ip_address(s)
+        if ip.is_global:
+            return s
+        return None
     except ValueError:
         pass
 
@@ -361,10 +363,14 @@ def _read_domain_cache(path: str) -> dict[str, str]:
                     orig, canon = line.split(",", 1)
                     orig = orig.strip()
                     canon = canon.strip()
-                    if orig and canon:
-                        out[orig] = canon
+                    orig_norm = _normalize_domain_candidate(orig)
+                    canon_norm = _normalize_domain_candidate(canon)
+                    if orig_norm and canon_norm:
+                        out[orig_norm] = canon_norm
                     continue
-                out[line] = line
+                norm = _normalize_domain_candidate(line)
+                if norm:
+                    out[norm] = norm
             return out
     except FileNotFoundError:
         return {}
