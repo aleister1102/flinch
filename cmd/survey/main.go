@@ -22,7 +22,6 @@ import (
 
 	"github.com/cheggaaa/pb"
 	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/fasthttpproxy"
 )
 
 const (
@@ -152,8 +151,10 @@ func main() {
 		if proxyURL.Scheme != "http" {
 			log.Fatalf("unsupported proxy scheme: %s", proxyURL.Scheme)
 		}
-		fastClient.Dial = fasthttpproxy.FasthttpHTTPDialerTimeout(proxyURL.String(), *timeout)
+		fastClient.Dial = dialViaHTTPProxy(proxyURL, *timeout)
 		fastClient.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		fastClient.Dial = dialDirect(*timeout)
 	}
 
 	for _, domain := range domainList {
@@ -169,6 +170,79 @@ func main() {
 
 	wg.Wait()
 	bar.Finish()
+}
+
+func dialDirect(timeout time.Duration) func(addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: timeout}
+	return func(addr string) (net.Conn, error) {
+		return d.Dial("tcp", addr)
+	}
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+func dialViaHTTPProxy(proxyURL *url.URL, timeout time.Duration) func(addr string) (net.Conn, error) {
+	proxyHost := proxyURL.Host
+	if !strings.Contains(proxyHost, ":") {
+		proxyHost = proxyHost + ":80"
+	}
+
+	d := &net.Dialer{Timeout: timeout}
+	return func(addr string) (net.Conn, error) {
+		conn, err := d.Dial("tcp", proxyHost)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n\r\n", addr, addr, userAgent)
+		if _, err := conn.Write([]byte(connectReq)); err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		reader := bufio.NewReader(conn)
+		statusLine, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		fields := strings.Fields(statusLine)
+		if len(fields) < 2 || fields[1] != "200" {
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			conn.Close()
+			return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(statusLine))
+		}
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil || line == "\r\n" {
+				break
+			}
+		}
+
+		_ = conn.SetDeadline(time.Time{})
+
+		if reader.Buffered() > 0 {
+			return &bufferedConn{Conn: conn, r: reader}, nil
+		}
+		return conn, nil
+	}
 }
 
 func parseDomainsFile(filename string, colOverride *int) ([]string, error) {
