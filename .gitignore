@@ -3,6 +3,7 @@
 .trae/skills
 .venv/
 .uv_cache/
+.cache/
 
 bin/
 responses/
